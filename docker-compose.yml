@@ -1,0 +1,32 @@
+services:
+  api:
+    build: ./apps/api
+    ports:
+      - "8000:8000"
+    environment:
+      - LAMA_DEVICE=${LAMA_DEVICE:-cpu}
+      - TORCH_HOME=/app/.cache/torch
+      - EASYOCR_MODULE_PATH=/app/.cache/easyocr
+    volumes:
+      - lama-cache:/app/.cache
+    # Uncomment for NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  web:
+    build: ./apps/web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - API_INTERNAL_URL=http://api:8000
+    depends_on:
+      - api
+
+volumes:
+  lama-cache:

@@ -1,0 +1,25 @@
+# The Modal worker (worker/modal_app.py) builds its own image and pins these
+# there. This file is for reference or for running the same pipeline on RunPod /
+# a bare GPU box. Install torch from the CUDA index first:
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+transformers==4.49.0
+accelerate>=1.0
+einops
+timm
+opencv-python-headless
+pillow
+numpy<2
+diffusers>=0.31
+safetensors
+simple-lama-inpainting==0.1.2
+realesrgan==0.3.0
+basicsr==1.4.2
+huggingface_hub>=0.25
+scipy
+av
+python-multipart
+fastapi[standard]
+modal
+# SAM 2 (optional but recommended for tight masks):
+#   pip install "git+https://github.com/facebookresearch/sam2.git"
+# ProPainter (video): git clone https://github.com/sczhou/ProPainter && pip install -r ProPainter/requirements.txt
