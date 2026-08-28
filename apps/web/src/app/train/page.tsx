@@ -621,6 +621,11 @@ export default function TrainPage() {
               <span className="rounded-full px-3 py-1" style={{ background: "#f3ebe4", color: "var(--ink)" }}>
                 Còn sót (thấp = tốt): {evalMetrics.mean_residual}
               </span>
+              {evalMetrics.lpips && evalMetrics.lpips !== "None" && (
+                <span className="rounded-full px-3 py-1" style={{ background: "#ede9fe", color: "#6d28d9" }}>
+                  LPIPS (thấp = giống ảnh gốc): {evalMetrics.lpips}
+                </span>
+              )}
             </div>
           )}
           {evalUrl && (

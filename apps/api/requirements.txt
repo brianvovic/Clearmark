@@ -13,3 +13,5 @@ httpx==0.28.1            # talk to the GPU worker (engine.py, video_tasks.py)
 # simple-lama-inpainting==0.1.2
 # Optional — only if you use Cloudflare R2 / S3 for video storage:
 # boto3==1.35.0
+# LPIPS perceptual metric (optional)
+# lpips==0.1.4

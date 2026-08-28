@@ -33,6 +33,32 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter / union) if union else 0.0
 
 
+_lpips_net = None
+_lpips_dev = "cpu"
+
+
+def _lpips_score(a_rgb: np.ndarray, b_rgb: np.ndarray) -> float | None:
+    """Perceptual distance (LPIPS) between two RGB images — lower = more alike.
+    Objective 'how clean is the result vs the true image', beyond pixel diff."""
+    global _lpips_net, _lpips_dev
+    try:
+        import lpips
+        import torch
+
+        if _lpips_net is None:
+            _lpips_dev = "cuda" if torch.cuda.is_available() else "cpu"
+            _lpips_net = lpips.LPIPS(net="alex", verbose=False).to(_lpips_dev).eval()
+
+        def to_t(x):
+            t = torch.from_numpy(x).permute(2, 0, 1).float().div(127.5).sub(1.0)
+            return t.unsqueeze(0).to(_lpips_dev)
+
+        with torch.inference_mode():
+            return float(_lpips_net(to_t(a_rgb), to_t(b_rgb)).item())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
     from services import engine, wm_detector
 
@@ -40,7 +66,7 @@ def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
     files = _list_clean(clean_dir)
     rng = random.Random()
     rows = []
-    ious, residuals, detected = [], [], 0
+    ious, residuals, lpips_scores, detected = [], [], [], 0
 
     for i in range(n):
         if files:
@@ -65,6 +91,9 @@ def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
         m = gt > 0
         residuals.append(float(np.abs(removed[m].astype(int) - clean[m].astype(int)).mean())
                          if m.any() else 0.0)
+        lp = _lpips_score(removed, clean)
+        if lp is not None:
+            lpips_scores.append(lp)
 
         row = np.concatenate([img, np.full((IMG_SIZE, 6, 3), 255, np.uint8), removed], axis=1)
         rows.append(row)
@@ -80,6 +109,7 @@ def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
         "detect_rate": round(detected / n, 2),
         "mean_iou": round(float(np.mean(ious)), 3),
         "mean_residual": round(float(np.mean(residuals)), 1),
+        "lpips": round(float(np.mean(lpips_scores)), 3) if lpips_scores else None,
         "wm_assets": len(assets),
     }
     logger.info("eval %s", metrics)
