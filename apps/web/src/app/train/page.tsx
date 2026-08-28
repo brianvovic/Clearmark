@@ -13,8 +13,10 @@ type TrainStatus = {
   watermark_count: number;
   has_model: boolean;
   model_epochs: number;
+  model_size_mb: number;
   has_removal_model: boolean;
   removal_epochs: number;
+  removal_size_mb: number;
 };
 
 type Kind = "detector" | "removal";
@@ -27,6 +29,7 @@ export default function TrainPage() {
   const [epochs, setEpochs] = useState(8);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [evalUrl, setEvalUrl] = useState<string | null>(null);
@@ -90,13 +93,18 @@ export default function TrainPage() {
   const uploadModel = async (file: File) => {
     setWorking("model");
     setError(null);
+    setNotice(null);
     try {
       const form = new FormData();
       form.append("model", file);
       form.append("kind", kind);
       const r = await fetch("/api/train/upload-model", { method: "POST", body: form });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "File model lỗi.");
-      setStatus(await r.json());
+      const s: TrainStatus = await r.json();
+      setStatus(s);
+      const ep = kind === "removal" ? s.removal_epochs : s.model_epochs;
+      const label = kind === "removal" ? "Removal" : "Detector";
+      setNotice(`✓ Đã nạp thành công model ${label} từ "${file.name}" — ${ep} vòng. Đã tích hợp vào hệ thống; train tiếp sẽ cộng dồn vào đây.`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Lỗi.");
     } finally {
@@ -225,6 +233,30 @@ export default function TrainPage() {
         <li><strong className="text-[var(--ink)]">3.</strong> Xong là model tự dùng cho trang xóa. Tải model (.pt) về để backup.</li>
         <li><strong className="text-[var(--ink)]">4.</strong> <strong>Học cộng dồn:</strong> hôm sau tải thêm ảnh &amp; train tiếp — AI <strong>không học lại từ đầu</strong> mà cộng dồn vào cùng một file, ngày càng thông minh. Mất file thì tải file cũ lên để train tiếp.</li>
       </ol>
+
+      {/* Current models — always visible so you know what's integrated */}
+      <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="rounded-2xl border p-4" style={{ borderColor: "var(--line)", background: status?.has_model ? "#f0fdf4" : "#fff" }}>
+          <p className="text-sm font-semibold text-[var(--ink)]">🔍 Detector (tìm watermark)</p>
+          {status?.has_model ? (
+            <p className="text-xs text-[var(--ink-muted)]">Đã tích hợp · <strong>{status.model_epochs} vòng</strong> · {status.model_size_mb} MB</p>
+          ) : (
+            <p className="text-xs text-[var(--ink-muted)]">Chưa có — hãy train hoặc tải file lên</p>
+          )}
+        </div>
+        <div className="rounded-2xl border p-4" style={{ borderColor: "var(--line)", background: status?.has_removal_model ? "#f0fdf4" : "#fff" }}>
+          <p className="text-sm font-semibold text-[var(--ink)]">🎨 Removal (xóa &amp; dựng nền)</p>
+          {status?.has_removal_model ? (
+            <p className="text-xs text-[var(--ink-muted)]">Đã tích hợp · <strong>{status.removal_epochs} vòng</strong> · {status.removal_size_mb} MB</p>
+          ) : (
+            <p className="text-xs text-[var(--ink-muted)]">Chưa có — hãy train hoặc tải file lên</p>
+          )}
+        </div>
+      </div>
+      <p className="mb-5 text-xs text-[var(--ink-muted)]">
+        Đây là <strong>2 model riêng biệt</strong> (mạng khác nhau) — Detector nhỏ (~7 MB) tìm chỗ có watermark, Removal lớn (~24 MB) vẽ lại nền.
+        Hệ thống dùng cả hai nối tiếp; <strong>không gộp chung 1 file</strong>. Mỗi loại chỉ cần <strong>1 file cộng dồn</strong> — tải file mới nhất lên là đủ để train tiếp.
+      </p>
 
       <div
         onDragOver={(e) => {
@@ -497,7 +529,7 @@ export default function TrainPage() {
             className="rounded-xl px-4 py-2.5 text-sm font-semibold disabled:opacity-50"
             style={{ background: "#f3ebe4", color: "var(--ink)" }}
           >
-            {working === "model" ? "Đang nạp…" : "⬆ Tải model cũ lên (train tiếp)"}
+            {working === "model" ? "Đang nạp…" : `⬆ Tải model ${kind === "removal" ? "Removal" : "Detector"} cũ lên (train tiếp)`}
           </button>
           <input
             ref={modelRef}
@@ -575,6 +607,11 @@ export default function TrainPage() {
         </div>
       )}
 
+      {notice && (
+        <p className="mt-4 rounded-xl px-3 py-2 text-sm" style={{ background: "#f0fdf4", color: "#15803d" }}>
+          {notice}
+        </p>
+      )}
       {error && (
         <p className="mt-4 rounded-xl px-3 py-2 text-sm" style={{ background: "#fff1f0", color: "#9b1c1c" }}>
           {error}

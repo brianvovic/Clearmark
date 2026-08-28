@@ -113,9 +113,18 @@ def status() -> dict:
     s["watermark_count"] = count_watermarks()
     s["has_model"] = os.path.exists(MODEL_OUT)
     s["model_epochs"] = _model_epochs("detector")
+    s["model_size_mb"] = _size_mb(MODEL_OUT)
     s["has_removal_model"] = os.path.exists(MODEL_REMOVAL)
     s["removal_epochs"] = _model_epochs("removal")
+    s["removal_size_mb"] = _size_mb(MODEL_REMOVAL)
     return s
+
+
+def _size_mb(path: str) -> float:
+    try:
+        return round(os.path.getsize(path) / 1e6, 1)
+    except OSError:
+        return 0.0
 
 
 def count_clean() -> int:
