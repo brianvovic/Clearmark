@@ -53,6 +53,13 @@ async def lifespan(_app: FastAPI):
         logger.info("LaMa ready on %s.", dev)
     except Exception as exc:  # noqa: BLE001
         logger.warning("LaMa warm-up deferred: %s", exc)
+    # If a training run was cut off by a crash/close, pick up where it left off.
+    try:
+        from services import train_jobs
+
+        train_jobs.resume_if_interrupted()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("resume check failed: %s", exc)
     yield
 
 

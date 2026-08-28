@@ -72,7 +72,7 @@ def build_removal_net():
 
 
 def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = None,
-                  epochs: int = 10, batch: int = 6, progress_cb=None) -> dict:
+                  epochs: int = 10, batch: int = 6, progress_cb=None, epoch_cb=None) -> dict:
     import torch
     from torch.utils.data import DataLoader, Dataset
 
@@ -98,7 +98,7 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
             w = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0) * 4 + 1  # weight in wm
             return x, y, w
 
-    steps_per = max(2, len(files) * 6 // batch)
+    steps_per = max(2, min(len(files) * 3, 6000) // batch)
     dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = build_removal_net().to(dev)
@@ -113,6 +113,7 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
             logger.warning("removal resume failed: %s", exc)
     opt = torch.optim.Adam(net.parameters(), 8e-4)
 
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     net.train()
     hist, step, total = [], 0, epochs * len(dl)
     for ep in range(epochs):
@@ -129,12 +130,15 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
             if progress_cb and step % 2 == 0:
                 progress_cb(step / total, float(loss.item()))
         hist.append(run / len(dl))
-        logger.info("removal epoch %d/%d L1=%.4f", ep + 1, epochs, hist[-1])
+        total_epochs = prev_epochs + ep + 1
+        tmp = out_path + ".tmp"  # checkpoint every epoch (crash-safe)
+        torch.save({"state": net.state_dict(), "img_size": IMG_SIZE, "trained_epochs": total_epochs}, tmp)
+        os.replace(tmp, out_path)
+        logger.info("removal epoch %d/%d L1=%.4f -> saved (%d total)", ep + 1, epochs, hist[-1], total_epochs)
+        if epoch_cb:
+            epoch_cb(total_epochs, prev_epochs + epochs, round(hist[-1], 4))
         if progress_cb:
             progress_cb((ep + 1) / epochs, hist[-1])
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    total_epochs = prev_epochs + epochs
-    torch.save({"state": net.state_dict(), "img_size": IMG_SIZE, "trained_epochs": total_epochs}, out_path)
     return {"final_loss": round(hist[-1], 4) if hist else None, "epochs": epochs,
-            "trained_epochs": total_epochs, "resumed": prev_epochs > 0, "samples": len(files)}
+            "trained_epochs": prev_epochs + epochs, "resumed": prev_epochs > 0, "samples": len(files)}

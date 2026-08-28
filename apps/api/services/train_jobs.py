@@ -22,10 +22,31 @@ CLEAN_DIR = os.path.join(_BASE, "clean")
 _ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 MODEL_OUT = os.path.join(_ASSETS, "wm_detector.pt")          # detector (find mask)
 MODEL_REMOVAL = os.path.join(_ASSETS, "wm_remover.pt")       # end-to-end removal
+JOB_STATE = os.path.join(_ASSETS, "train_job.json")          # survives restarts
 
 
 def _model_path(kind: str) -> str:
     return MODEL_REMOVAL if kind == "removal" else MODEL_OUT
+
+
+def _write_job(kind: str, target: int, status: str) -> None:
+    import json
+
+    try:
+        with open(JOB_STATE, "w") as f:
+            json.dump({"kind": kind, "target_epochs": target, "status": status}, f)
+    except OSError:
+        pass
+
+
+def _read_job() -> dict | None:
+    import json
+
+    try:
+        with open(JOB_STATE) as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
 
 from training.pipeline import WATERMARKS_DIR  # library of logos/stickers to learn
 
@@ -125,11 +146,37 @@ def start(epochs: int = 8, fresh: bool = False, kind: str = "detector") -> None:
     if count_clean() < 4:
         raise ValueError("Cần ít nhất 4 ảnh sạch để train (nên vài chục ảnh càng tốt).")
     kind = "removal" if kind == "removal" else "detector"
-    target = _model_path(kind)
-    resume = None if fresh else (target if os.path.exists(target) else None)
+    path = _model_path(kind)
+    base = 0 if fresh else _model_epochs(kind)
+    target = base + epochs                       # FINAL cumulative epoch count
+    resume = None if fresh else (path if os.path.exists(path) else None)
+    _write_job(kind, target, "running")
     _set(status="running", progress=0.0, loss=None, kind=kind,
          message=f"Chuẩn bị dữ liệu ({'Removal' if kind == 'removal' else 'Detector'})…")
-    threading.Thread(target=_run, args=(epochs, resume, kind), daemon=True).start()
+    threading.Thread(target=_run, args=(epochs, resume, kind, target), daemon=True).start()
+
+
+def resume_if_interrupted() -> None:
+    """
+    On server startup: if a training job was cut off (crash/close), continue the
+    remaining epochs from the last per-epoch checkpoint instead of losing progress.
+    """
+    job = _read_job()
+    if not job or job.get("status") != "running":
+        return
+    kind = job.get("kind", "detector")
+    target = int(job.get("target_epochs", 0))
+    base = _model_epochs(kind)
+    remaining = target - base
+    if remaining <= 0 or count_clean() < 4:
+        _write_job(kind, target, "done")
+        return
+    logger.info("Auto-resuming interrupted %s training: %d/%d epochs done, %d to go",
+                kind, base, target, remaining)
+    try:
+        start(remaining, fresh=False, kind=kind)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("auto-resume failed: %s", exc)
 
 
 def scrape(count: int, source: str = "picsum", api_key: str | None = None,
@@ -196,7 +243,8 @@ def _reload(kind: str) -> None:
         pass
 
 
-def _run(epochs: int, resume: str | None, kind: str) -> None:
+def _run(epochs: int, resume: str | None, kind: str, target: int) -> None:
+    label = "Removal" if kind == "removal" else "Detector"
     try:
         if kind == "removal":
             from training.removal import train_removal as _train
@@ -204,15 +252,25 @@ def _run(epochs: int, resume: str | None, kind: str) -> None:
             from training.pipeline import train as _train
 
         def cb(p: float, loss: float):
-            _set(progress=min(0.99, p), loss=round(loss, 4), message="Đang train…")
+            _set(progress=min(0.99, p), loss=round(loss, 4))
 
-        info = _train(CLEAN_DIR, _model_path(kind), resume_from=resume, epochs=epochs, progress_cb=cb)
+        def on_epoch(done_total: int, run_target: int, loss: float):
+            # Each finished epoch is already saved to disk by the trainer — reload
+            # it so the live system uses it immediately (auto-integrated), and show
+            # the cumulative epoch count.
+            _reload(kind)
+            _set(status="running", loss=loss,
+                 message=f"{label}: đã xong & lưu vòng {done_total}/{target} "
+                         f"(loss {loss}). An toàn nếu tắt máy.")
+
+        info = _train(CLEAN_DIR, _model_path(kind), resume_from=resume,
+                      epochs=epochs, progress_cb=cb, epoch_cb=on_epoch)
         _reload(kind)
-        resumed = " (train tiếp từ model cũ)" if info.get("resumed") else ""
-        label = "Removal" if kind == "removal" else "Detector"
+        _write_job(kind, target, "done")
         _set(status="done", progress=1.0, loss=info.get("final_loss"),
              message=f"Xong {label}! Loss {info.get('final_loss')}, tổng "
-                     f"{info.get('trained_epochs')} vòng{resumed}. Model đã sẵn sàng.")
+                     f"{info.get('trained_epochs')} vòng. Model đã tự tích hợp, sẵn sàng xóa.")
     except Exception as exc:  # noqa: BLE001
         logger.exception("training failed")
+        _write_job(kind, target, "done")  # a real error — don't auto-resume-loop
         _set(status="error", message=str(exc)[:300])

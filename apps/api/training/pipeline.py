@@ -278,7 +278,7 @@ def _build_unet():
 
 
 def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
-          epochs: int = 8, batch: int = 8, progress_cb=None) -> dict:
+          epochs: int = 8, batch: int = 8, progress_cb=None, epoch_cb=None) -> dict:
     import torch
     from torch.utils.data import DataLoader, Dataset
 
@@ -302,7 +302,9 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
             y = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
             return x, y
 
-    steps_per = max(2, len(files) * 6 // batch)
+    # ~1 pass over the data per epoch (capped) so epochs finish fast on big sets
+    # and each is checkpointed — better than one giant slow epoch.
+    steps_per = max(2, min(len(files) * 3, 6000) // batch)
     dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = _build_unet().to(dev)
@@ -326,6 +328,7 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
         p = torch.sigmoid(logits)
         return 1 - (2 * (p * y).sum() + 1) / (p.sum() + y.sum() + 1)
 
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     net.train()
     hist, step, total = [], 0, epochs * len(dl)
     for ep in range(epochs):
@@ -342,14 +345,20 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
             if progress_cb and step % 2 == 0:
                 progress_cb(step / total, float(loss.item()))
         hist.append(run / len(dl))
-        logger.info("epoch %d/%d loss=%.4f", ep + 1, epochs, hist[-1])
+        total_epochs = prev_epochs + ep + 1
+        # CHECKPOINT AFTER EVERY EPOCH — a crash loses at most this one epoch, and
+        # the model is immediately usable/integrated at its current level.
+        tmp = out_path + ".tmp"
+        torch.save({"state": net.state_dict(), "img_size": IMG_SIZE,
+                    "trained_epochs": total_epochs}, tmp)
+        os.replace(tmp, out_path)
+        logger.info("epoch %d/%d loss=%.4f -> saved (%d total epochs)",
+                    ep + 1, epochs, hist[-1], total_epochs)
+        if epoch_cb:
+            epoch_cb(total_epochs, prev_epochs + epochs, round(hist[-1], 4))
         if progress_cb:
             progress_cb((ep + 1) / epochs, hist[-1])
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    total_epochs = prev_epochs + epochs
-    torch.save({"state": net.state_dict(), "img_size": IMG_SIZE,
-                "trained_epochs": total_epochs}, out_path)
     return {"final_loss": round(hist[-1], 4) if hist else None, "epochs": epochs,
-            "trained_epochs": total_epochs, "resumed": prev_epochs > 0,
+            "trained_epochs": prev_epochs + epochs, "resumed": prev_epochs > 0,
             "samples": len(files), "wm_assets": len(assets)}
