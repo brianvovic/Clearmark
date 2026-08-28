@@ -104,10 +104,10 @@ async def _read_upload(file: UploadFile, label: str = "file") -> bytes:
     return data
 
 
-def _process_auto(raw: bytes, remove_text: bool = True) -> bytes:
+def _process_auto(raw: bytes, remove_text: bool = True, mode: str = "smart") -> bytes:
     original = _load_image(raw)
     # engine routes to the GPU worker when configured, else local full-res tiler.
-    result = engine.erase_auto(original, remove_text)
+    result = engine.erase_auto(original, remove_text, mode=mode)
     return _to_png_bytes(result)
 
 
@@ -137,16 +137,19 @@ def _truthy(v: Optional[str]) -> bool:
 async def remove_watermark(
     image: UploadFile = File(...),
     remove_text: Optional[str] = Form(default="1"),
+    mode: Optional[str] = Form(default="smart"),
     return_mask: Optional[str] = Form(default="0"),
 ):
     """Auto-detect watermark regions and inpaint at full resolution.
 
+    ``mode``: fast (LaMa heuristic, nhẹ) | smart (trained AI, default) | pro (SDXL).
     ``remove_text`` (default on) also targets OCR-detected text. Set to 0 to
     protect real printed text and only remove coloured logo/stamp watermarks.
     """
     raw = await _read_upload(image, "ảnh")
+    m = mode if mode in ("fast", "smart", "pro") else "smart"
     try:
-        png = _process_auto(raw, remove_text=_truthy(remove_text))
+        png = _process_auto(raw, remove_text=_truthy(remove_text), mode=m)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except HTTPException:

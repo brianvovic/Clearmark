@@ -101,6 +101,8 @@ export default function HomePage() {
   // Off by default so real printed text (on shirts, packaging, signs) is never
   // erased. Turn on only to also remove text-style watermarks.
   const [removeText, setRemoveText] = useState(false);
+  // Processing tier: fast (LaMa, nhẹ) · smart (AI đã train) · pro (SDXL, ảnh khó).
+  const [procMode, setProcMode] = useState<"fast" | "smart" | "pro">("smart");
   // Session refine ("Xóa thêm vùng"): brush leftover spots on the result; each
   // pass re-erases from the pristine server-side original (no cumulative blur).
   const [refining, setRefining] = useState(false);
@@ -549,6 +551,7 @@ export default function HomePage() {
           const form = new FormData();
           form.append("image", item.file);
           form.append("remove_text", removeText ? "1" : "0");
+          form.append("mode", procMode);
           const res = await fetch("/api/remove", { method: "POST", body: form });
           if (!res.ok) {
             nextItems.push({
@@ -981,6 +984,27 @@ export default function HomePage() {
                   <p className="text-sm text-[var(--ink-muted)]">
                     Đang xử lý {progress.done}/{progress.total}…
                   </p>
+                )}
+
+                {mode === "auto" && (
+                  <div className="flex flex-wrap gap-2">
+                    {([
+                      { id: "fast", label: "Nhanh", hint: "LaMa · nhẹ, tức thì" },
+                      { id: "smart", label: "Thông minh", hint: "AI đã train · tốt nhất" },
+                      { id: "pro", label: "PRO", hint: "SDXL · ảnh khó (nếu bật)" },
+                    ] as const).map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setProcMode(m.id)}
+                        className="rounded-xl px-3 py-2 text-left text-sm font-semibold transition"
+                        style={procMode === m.id ? { background: "var(--accent)", color: "#fff" } : { background: "var(--accent-soft)", color: "var(--accent-deep)" }}
+                      >
+                        {m.label}
+                        <span className="block text-[10px] font-normal opacity-80">{m.hint}</span>
+                      </button>
+                    ))}
+                  </div>
                 )}
 
                 {mode === "auto" && (

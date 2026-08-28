@@ -84,8 +84,12 @@ def backend_label() -> str:
 # --------------------------------------------------------------------------- #
 # Detection
 # --------------------------------------------------------------------------- #
-def detect_mask(original: Image.Image, remove_text: bool) -> Image.Image:
-    """Return an L-mode mask (white = remove) at the ORIGINAL resolution."""
+def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
+    """Return an L-mode mask (white = remove) at the ORIGINAL resolution.
+
+    ``mode``: "smart" (default) uses the trained detector + Florence-2 for best
+    accuracy; "fast" skips them and uses only the instant colour/heuristic mask.
+    """
     if worker_url():
         try:
             png = _post(
@@ -102,10 +106,11 @@ def detect_mask(original: Image.Image, remove_text: bool) -> Image.Image:
 
     # Best when trained: the learned watermark detector generalises to any
     # position / scale / tiling. Used as the primary detector once a model exists.
+    # Skipped in "fast" mode (heuristic only).
     try:
         from services import wm_detector
 
-        if wm_detector.available():
+        if mode != "fast" and wm_detector.available():
             mask = wm_detector.detect(original)
             arr = np.array(mask)
             if arr.max() >= 128 and float((arr > 0).mean()) <= 0.3:
@@ -140,7 +145,7 @@ def detect_mask(original: Image.Image, remove_text: bool) -> Image.Image:
     try:
         from services import florence
 
-        if florence.available():
+        if mode != "fast" and florence.available():
             mask = florence.detect(original, remove_text)
             if np.array(mask).max() >= 128:
                 return mask
@@ -159,8 +164,12 @@ def detect_mask(original: Image.Image, remove_text: bool) -> Image.Image:
 # --------------------------------------------------------------------------- #
 # Removal
 # --------------------------------------------------------------------------- #
-def erase(original: Image.Image, mask: Image.Image) -> Image.Image:
-    """Remove everything under ``mask`` at full resolution."""
+def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Image.Image:
+    """Remove everything under ``mask`` at full resolution.
+
+    ``mode``: "smart" uses the trained removal model when present; "fast" uses the
+    lightweight LaMa tiler; "pro" prefers the SDXL diffusion path (worker/local).
+    """
     if worker_url():
         try:
             png = _post(
@@ -169,33 +178,44 @@ def erase(original: Image.Image, mask: Image.Image) -> Image.Image:
                     "image": ("image.png", _png(original), "image/png"),
                     "mask": ("mask.png", _png(mask.convert("L")), "image/png"),
                 },
-                data={"predict_mode": os.getenv("GPU_PREDICT_MODE", "3.0")},
+                data={"predict_mode": "4.0" if mode == "pro" else os.getenv("GPU_PREDICT_MODE", "3.0")},
             )
             return Image.open(io.BytesIO(png)).convert("RGB")
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU erase failed, falling back to local: %s", exc)
 
-    # Trained end-to-end removal model (learns to rebuild the background). Applied
-    # only inside the mask, so untouched areas stay pixel-faithful.
-    try:
-        from services import wm_remover
+    # PRO: local SDXL diffusion inpainting for hard cases (heavy — only if enabled).
+    if mode == "pro":
+        try:
+            from services import sdxl
 
-        if wm_remover.available():
-            return wm_remover.remove(original, mask)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("removal model failed, using LaMa: %s", exc)
+            if sdxl.available():
+                return sdxl.inpaint(original, mask)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SDXL PRO failed, falling back: %s", exc)
+
+    # Trained end-to-end removal model (learns to rebuild the background). Applied
+    # only inside the mask, so untouched areas stay pixel-faithful. Skipped in fast.
+    if mode != "fast":
+        try:
+            from services import wm_remover
+
+            if wm_remover.available():
+                return wm_remover.remove(original, mask)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("removal model failed, using LaMa: %s", exc)
 
     return inpaint_fullres(original, mask)
 
 
-def erase_auto(original: Image.Image, remove_text: bool) -> Image.Image:
-    mask = detect_mask(original, remove_text)
+def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
+    mask = detect_mask(original, remove_text, mode=mode)
     if np.array(mask).max() < 128:
         hint = "chữ/logo mờ" if remove_text else "logo/watermark màu"
         raise ValueError(
             f"Không phát hiện {hint} rõ. Chuyển tab Thủ công, tô đúng vùng cần xóa rồi bấm Xử lý."
         )
-    return erase(original, mask)
+    return erase(original, mask, mode=mode)
 
 
 # --------------------------------------------------------------------------- #
