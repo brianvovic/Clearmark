@@ -58,6 +58,31 @@ export default function TrainPage() {
     refresh();
   }, [refresh]);
 
+  // Remember scrape source/keyword/API key across sessions (per-browser).
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("clearmark_scrape");
+      if (saved) {
+        const j = JSON.parse(saved);
+        if (j.source) setScrapeSource(j.source);
+        if (typeof j.query === "string") setScrapeQuery(j.query);
+        if (typeof j.key === "string") setScrapeKey(j.key);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "clearmark_scrape",
+        JSON.stringify({ source: scrapeSource, query: scrapeQuery, key: scrapeKey }),
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [scrapeSource, scrapeQuery, scrapeKey]);
+
   // Poll while a job runs (training or downloading images).
   useEffect(() => {
     if (status?.status !== "running" && status?.status !== "scraping") return;

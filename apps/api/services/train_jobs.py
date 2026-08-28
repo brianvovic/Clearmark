@@ -223,6 +223,17 @@ def set_model(data: bytes, kind: str = "detector") -> None:
         import torch
 
         ck = torch.load(tmp, map_location="cpu")
+        # The Removal net is deeper (has a 4th down block "d4"); the Detector net
+        # does not. Catch a wrong-kind upload with a clear message BEFORE the scary
+        # size-mismatch dump, so the user just picks the right tab.
+        keys = list(ck.get("state", {}).keys())
+        looks_removal = any(k.startswith("d4.") for k in keys)
+        if kind == "detector" and looks_removal:
+            raise ValueError("File này là model REMOVAL, nhưng bạn đang chọn ô 'Detector'. "
+                             "Hãy bấm ô 'Removal — xóa & dựng nền' rồi tải lại.")
+        if kind == "removal" and not looks_removal:
+            raise ValueError("File này là model DETECTOR, nhưng bạn đang chọn ô 'Removal'. "
+                             "Hãy bấm ô 'Detector — tìm watermark' rồi tải lại.")
         if kind == "removal":
             from training.removal import build_removal_net
 
@@ -231,9 +242,12 @@ def set_model(data: bytes, kind: str = "detector") -> None:
             from training.pipeline import _build_unet
 
             _build_unet().load_state_dict(ck["state"])
+    except ValueError:
+        os.remove(tmp)
+        raise
     except Exception as exc:  # noqa: BLE001
         os.remove(tmp)
-        raise ValueError(f"File model không hợp lệ (sai loại?): {exc}") from exc
+        raise ValueError(f"File .pt không đọc được hoặc hỏng: {str(exc)[:100]}") from exc
     os.replace(tmp, target)
     _reload(kind)
 
