@@ -215,6 +215,15 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
         raise ValueError(
             f"Không phát hiện {hint} rõ. Chuyển tab Thủ công, tô đúng vùng cần xóa rồi bấm Xử lý."
         )
+    # Optional: snap the mask to real edges with SAM (opt-in, smart/pro only).
+    if mode != "fast":
+        try:
+            from services import sam_refine
+
+            if sam_refine.available():
+                mask = sam_refine.refine(original, mask)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SAM refine skipped: %s", exc)
     return erase(original, mask, mode=mode)
 
 
