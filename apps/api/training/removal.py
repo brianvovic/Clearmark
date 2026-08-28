@@ -92,7 +92,8 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
         def __getitem__(self, i):
             p = self.paths[i % len(self.paths)]
             clean = np.array(Image.open(p).convert("RGB").resize((IMG_SIZE, IMG_SIZE)))
-            wm, mask = synthesize(clean, assets, random.Random(i * 11 + base_rng.randint(0, 1 << 20)))
+            wm, mask = synthesize(clean, assets, random.Random(i * 11 + base_rng.randint(0, 1 << 20)),
+                                  augment=False)
             x = torch.from_numpy(wm).permute(2, 0, 1).float() / 255.0
             y = torch.from_numpy(clean).permute(2, 0, 1).float() / 255.0
             w = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0) * 4 + 1  # weight in wm

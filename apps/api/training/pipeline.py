@@ -170,13 +170,46 @@ def _stamp(out: np.ndarray, mask: np.ndarray, wm: np.ndarray, x: int, y: int, op
     mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], (a[..., 0] > 0.05) * 255.0)
 
 
-def synthesize(clean: np.ndarray, assets: list[np.ndarray], rng: random.Random):
-    """Return (watermarked_uint8, mask_uint8) with 1–3 diverse watermarks."""
+def _augment(img: np.ndarray, rng: random.Random) -> np.ndarray:
+    """
+    Realistic degradations so the model isn't brittle to real (not pristine)
+    watermarked images: JPEG recompression, sensor noise, slight blur, and a
+    downscale→upscale round-trip. None of these move pixels, so the mask stays
+    exactly aligned.
+    """
+    out = img
+    if rng.random() < 0.25:  # low-res source: shrink then restore
+        f = rng.uniform(0.5, 0.85)
+        h, w = out.shape[:2]
+        small = cv2.resize(out, (max(8, int(w * f)), max(8, int(h * f))), interpolation=cv2.INTER_AREA)
+        out = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
+    if rng.random() < 0.3:  # slight blur
+        out = cv2.GaussianBlur(out, (0, 0), rng.uniform(0.4, 1.3))
+    if rng.random() < 0.4:  # sensor noise
+        out = np.clip(out.astype(np.float32) + np.random.normal(0, rng.uniform(2, 11), out.shape), 0, 255).astype(np.uint8)
+    if rng.random() < 0.65:  # JPEG recompression artefacts
+        ok, enc = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, rng.randint(35, 92)])
+        if ok:
+            out = cv2.imdecode(enc, cv2.IMREAD_COLOR)
+    return out
+
+
+def synthesize(clean: np.ndarray, assets: list[np.ndarray], rng: random.Random,
+               augment: bool = True):
+    """
+    Return (watermarked_uint8, mask_uint8) with 1–3 diverse watermarks.
+
+    ``augment`` adds JPEG/noise/blur realism — great for the DETECTOR (the mask
+    stays valid). The REMOVAL model passes augment=False so its target stays a
+    clean, sharp image (it only learns to remove the watermark, not to denoise).
+    """
     H, W = clean.shape[:2]
     out = clean.astype(np.float32).copy()
     mask = np.zeros((H, W), np.float32)
     for _ in range(rng.randint(1, 3)):
         wm = _pick_watermark(assets, rng)
+        if rng.random() < 0.3:  # some watermarks are themselves blurry/low-res
+            wm = cv2.GaussianBlur(wm, (0, 0), rng.uniform(0.5, 1.6))
         lh, lw = wm.shape[:2]
         target_w = int(W * rng.uniform(0.15, 0.6))
         target_h = max(8, int(lh * target_w / max(1, lw)))
@@ -191,7 +224,10 @@ def synthesize(clean: np.ndarray, assets: list[np.ndarray], rng: random.Random):
             x = rng.randint(-target_w // 6, max(1, W - target_w + target_w // 6))
             y = rng.randint(-target_h // 6, max(1, H - target_h + target_h // 6))
             _stamp(out, mask, wm_r, x, y, opacity)
-    return np.clip(out, 0, 255).astype(np.uint8), mask.astype(np.uint8)
+    result = np.clip(out, 0, 255).astype(np.uint8)
+    if augment:
+        result = _augment(result, rng)
+    return result, mask.astype(np.uint8)
 
 
 def _list_clean(clean_dir: str) -> list[str]:
