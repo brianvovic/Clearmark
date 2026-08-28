@@ -35,6 +35,9 @@ export default function TrainPage() {
   const [fresh, setFresh] = useState(false);
   const [kind, setKind] = useState<Kind>("detector");
   const [scrapeCount, setScrapeCount] = useState(200);
+  const [scrapeSource, setScrapeSource] = useState<"picsum" | "pexels" | "unsplash">("picsum");
+  const [scrapeQuery, setScrapeQuery] = useState("portrait woman model");
+  const [scrapeKey, setScrapeKey] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const wmRef = useRef<HTMLInputElement>(null);
   const modelRef = useRef<HTMLInputElement>(null);
@@ -145,14 +148,18 @@ export default function TrainPage() {
     try {
       const form = new FormData();
       form.append("count", String(scrapeCount));
-      form.append("source", "picsum");
+      form.append("source", scrapeSource);
+      if (scrapeSource !== "picsum") {
+        form.append("query", scrapeQuery);
+        form.append("api_key", scrapeKey);
+      }
       const r = await fetch("/api/train/scrape", { method: "POST", body: form });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || "Lỗi tải ảnh.");
       setStatus(await r.json());
     } catch (e) {
       setError(e instanceof Error ? e.message : "Lỗi.");
     }
-  }, [scrapeCount]);
+  }, [scrapeCount, scrapeSource, scrapeQuery, scrapeKey]);
 
   const showPreview = useCallback(async () => {
     setWorking("preview");
@@ -264,9 +271,24 @@ export default function TrainPage() {
       <div className="mt-4 rounded-2xl border p-4" style={{ borderColor: "var(--line)" }}>
         <p className="text-sm font-semibold text-[var(--ink)]">Chưa có ảnh sạch? Tải tự động từ internet</p>
         <p className="mb-2 text-xs text-[var(--ink-muted)]">
-          Ảnh CC0 miễn phí (Lorem Picsum / Unsplash) — không cần tài khoản. Nên lấy vài trăm–vài nghìn để AI đủ giỏi.
+          <strong>Picsum</strong>: ngẫu nhiên, không cần key (nhiều phong cảnh). <strong>Pexels/Unsplash</strong>: tìm theo từ khóa
+          (ảnh <strong>người/chân dung</strong>) — cần key miễn phí. Ảnh người giống dữ liệu bạn xử lý nên AI học tốt hơn.
         </p>
         <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm">
+            Nguồn
+            <select
+              value={scrapeSource}
+              onChange={(e) => setScrapeSource(e.target.value as "picsum" | "pexels" | "unsplash")}
+              className="rounded-lg border px-2 py-1"
+              style={{ borderColor: "var(--line)" }}
+              disabled={busyJob}
+            >
+              <option value="picsum">Picsum (không key)</option>
+              <option value="pexels">Pexels (ảnh người, cần key)</option>
+              <option value="unsplash">Unsplash (ảnh người, cần key)</option>
+            </select>
+          </label>
           <label className="flex items-center gap-2 text-sm">
             Số lượng
             <input
@@ -291,6 +313,42 @@ export default function TrainPage() {
             {status?.status === "scraping" ? "Đang tải…" : "⬇ Tải ảnh sạch tự động"}
           </button>
         </div>
+        {scrapeSource !== "picsum" && (
+          <div className="mt-3 space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-[var(--ink-muted)]">Từ khóa:</span>
+              {["portrait woman model", "woman bikini beach", "asian girl portrait", "full body woman", "beautiful woman selfie"].map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => setScrapeQuery(q)}
+                  className="rounded-full px-2.5 py-1 text-xs font-medium"
+                  style={scrapeQuery === q ? { background: "#0e7490", color: "#fff" } : { background: "#e0f2fe", color: "#075985" }}
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+            <input
+              type="text"
+              value={scrapeQuery}
+              onChange={(e) => setScrapeQuery(e.target.value)}
+              placeholder="Từ khóa tìm ảnh (vd: woman portrait model bikini)"
+              className="w-full rounded-lg border px-3 py-1.5 text-sm"
+              style={{ borderColor: "var(--line)" }}
+              disabled={busyJob}
+            />
+            <input
+              type="password"
+              value={scrapeKey}
+              onChange={(e) => setScrapeKey(e.target.value)}
+              placeholder={scrapeSource === "pexels" ? "Pexels API key (miễn phí: pexels.com/api)" : "Unsplash Access Key (unsplash.com/developers)"}
+              className="w-full rounded-lg border px-3 py-1.5 text-sm"
+              style={{ borderColor: "var(--line)" }}
+              disabled={busyJob}
+            />
+          </div>
+        )}
         {status?.status === "scraping" && (
           <div className="mt-3">
             <div className="h-2 w-full overflow-hidden rounded-full" style={{ background: "#f3ebe4" }}>

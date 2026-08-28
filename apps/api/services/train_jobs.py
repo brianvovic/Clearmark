@@ -132,22 +132,23 @@ def start(epochs: int = 8, fresh: bool = False, kind: str = "detector") -> None:
     threading.Thread(target=_run, args=(epochs, resume, kind), daemon=True).start()
 
 
-def scrape(count: int, source: str = "picsum", api_key: str | None = None) -> None:
+def scrape(count: int, source: str = "picsum", api_key: str | None = None,
+           query: str | None = None) -> None:
     with _lock:
         if _state["status"] in ("running", "scraping"):
             raise RuntimeError("Đang bận, chờ xong đã.")
     _set(status="scraping", progress=0.0, message="Đang tải ảnh sạch từ internet…")
-    threading.Thread(target=_run_scrape, args=(count, source, api_key), daemon=True).start()
+    threading.Thread(target=_run_scrape, args=(count, source, api_key, query), daemon=True).start()
 
 
-def _run_scrape(count: int, source: str, api_key: str | None) -> None:
+def _run_scrape(count: int, source: str, api_key: str | None, query: str | None) -> None:
     try:
         from training.scrape_clean import download
 
         def cb(p: float, n: int):
             _set(progress=min(0.99, p), message=f"Đã tải {n}/{count} ảnh sạch…")
 
-        info = download(count, CLEAN_DIR, source=source, api_key=api_key, progress_cb=cb)
+        info = download(count, CLEAN_DIR, source=source, api_key=api_key, query=query, progress_cb=cb)
         _set(status="done", progress=1.0,
              message=f"Xong! Đã tải {info['downloaded']} ảnh sạch. Giờ bấm train.")
     except Exception as exc:  # noqa: BLE001

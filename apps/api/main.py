@@ -31,10 +31,26 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".bmp"}
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    logger.info("Warming up LaMa model (device=%s)...", os.getenv("LAMA_DEVICE", "cpu"))
+    # Report the ACTUAL compute device (auto-detected), not the env-var default —
+    # a stale log here made it look like CPU even when the GPU was in use.
+    from services.lama import _device
+
+    dev = _device()
+    gpu_name = dev.upper()
+    if dev == "cuda":
+        try:
+            import torch
+
+            gpu_name = f"CUDA · {torch.cuda.get_device_name(0)}"
+        except Exception:  # noqa: BLE001
+            pass
+    logger.info("========================================")
+    logger.info(" ClearMark compute device: %s", gpu_name)
+    logger.info("========================================")
+    logger.info("Warming up LaMa model on %s...", dev)
     try:
         get_lama()
-        logger.info("LaMa ready.")
+        logger.info("LaMa ready on %s.", dev)
     except Exception as exc:  # noqa: BLE001
         logger.warning("LaMa warm-up deferred: %s", exc)
     yield
@@ -391,11 +407,13 @@ async def train_scrape(
     count: Optional[str] = Form(default="200"),
     source: Optional[str] = Form(default="picsum"),
     api_key: Optional[str] = Form(default=None),
+    query: Optional[str] = Form(default=None),
 ):
-    """Auto-download clean stock images into the training set (picsum/pexels/unsplash)."""
+    """Auto-download clean stock images (picsum/pexels/unsplash; query = people/portrait)."""
     try:
         n = max(1, min(5000, int(count or 200)))
-        train_jobs.scrape(n, source or "picsum", (api_key or "").strip() or None)
+        train_jobs.scrape(n, source or "picsum", (api_key or "").strip() or None,
+                          (query or "").strip() or None)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return train_jobs.status()

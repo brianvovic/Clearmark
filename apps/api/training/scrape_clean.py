@@ -44,18 +44,36 @@ def _valid_image(data: bytes) -> bool:
 
 
 def download(count: int, out_dir: str, *, source: str = "picsum",
-             api_key: str | None = None, progress_cb=None) -> dict:
+             api_key: str | None = None, query: str | None = None, progress_cb=None) -> dict:
+    """
+    ``query`` (e.g. "portrait woman model bikini") only applies to pexels/unsplash,
+    which have a search API — use it to fetch PEOPLE/PORTRAIT photos instead of
+    random landscapes. picsum has no categories (random only).
+    """
     import httpx
 
     os.makedirs(out_dir, exist_ok=True)
+    query = (query or "").strip()
     got, tries = 0, 0
+
+    def grab(client, url):
+        nonlocal got
+        try:
+            img = client.get(url)
+            if img.status_code == 200 and _valid_image(img.content):
+                _save(out_dir, got, img.content)
+                got += 1
+                if progress_cb:
+                    progress_cb(got / count, got)
+        except Exception:  # noqa: BLE001
+            pass
+
     with httpx.Client(timeout=30, follow_redirects=True) as client:
         if source == "picsum":
             while got < count and tries < count * 3:
                 tries += 1
                 try:
-                    r = client.get(f"https://picsum.photos/{SIZE}/{SIZE}",
-                                   params={"random": tries})
+                    r = client.get(f"https://picsum.photos/{SIZE}/{SIZE}", params={"random": tries})
                     if r.status_code == 200 and _valid_image(r.content):
                         _save(out_dir, tries, r.content)
                         got += 1
@@ -66,54 +84,57 @@ def download(count: int, out_dir: str, *, source: str = "picsum",
 
         elif source == "pexels":
             if not api_key:
-                raise ValueError("Pexels cần API key.")
+                raise ValueError("Pexels cần API key (miễn phí: pexels.com/api).")
             page = 1
-            while got < count and page < 200:
-                r = client.get("https://api.pexels.com/v1/curated",
-                               params={"per_page": 80, "page": page},
-                               headers={"Authorization": api_key})
+            while got < count and page < 300:
+                if query:
+                    r = client.get("https://api.pexels.com/v1/search",
+                                   params={"query": query, "per_page": 80, "page": page},
+                                   headers={"Authorization": api_key})
+                else:
+                    r = client.get("https://api.pexels.com/v1/curated",
+                                   params={"per_page": 80, "page": page},
+                                   headers={"Authorization": api_key})
                 if r.status_code != 200:
                     raise ValueError(f"Pexels API lỗi {r.status_code}: {r.text[:120]}")
-                for photo in r.json().get("photos", []):
+                photos = r.json().get("photos", [])
+                if not photos:
+                    break
+                for photo in photos:
                     if got >= count:
                         break
-                    url = photo.get("src", {}).get("large") or photo.get("src", {}).get("medium")
-                    try:
-                        img = client.get(url)
-                        if img.status_code == 200 and _valid_image(img.content):
-                            _save(out_dir, got, img.content)
-                            got += 1
-                            if progress_cb:
-                                progress_cb(got / count, got)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    grab(client, photo.get("src", {}).get("large") or photo.get("src", {}).get("medium"))
                 page += 1
 
         elif source == "unsplash":
             if not api_key:
-                raise ValueError("Unsplash cần Access Key.")
+                raise ValueError("Unsplash cần Access Key (miễn phí: unsplash.com/developers).")
+            page = 1
             while got < count:
-                r = client.get("https://api.unsplash.com/photos/random",
-                               params={"count": 30, "client_id": api_key})
-                if r.status_code != 200:
-                    raise ValueError(f"Unsplash API lỗi {r.status_code}: {r.text[:120]}")
-                for photo in r.json():
+                if query:
+                    r = client.get("https://api.unsplash.com/search/photos",
+                                   params={"query": query, "per_page": 30, "page": page,
+                                           "client_id": api_key})
+                    if r.status_code != 200:
+                        raise ValueError(f"Unsplash API lỗi {r.status_code}: {r.text[:120]}")
+                    items = r.json().get("results", [])
+                else:
+                    r = client.get("https://api.unsplash.com/photos/random",
+                                   params={"count": 30, "client_id": api_key})
+                    if r.status_code != 200:
+                        raise ValueError(f"Unsplash API lỗi {r.status_code}: {r.text[:120]}")
+                    items = r.json()
+                if not items:
+                    break
+                for photo in items:
                     if got >= count:
                         break
-                    url = photo.get("urls", {}).get("regular")
-                    try:
-                        img = client.get(url)
-                        if img.status_code == 200 and _valid_image(img.content):
-                            _save(out_dir, got, img.content)
-                            got += 1
-                            if progress_cb:
-                                progress_cb(got / count, got)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    grab(client, photo.get("urls", {}).get("regular"))
+                page += 1
         else:
             raise ValueError(f"Nguồn không hỗ trợ: {source}")
 
-    return {"downloaded": got, "source": source}
+    return {"downloaded": got, "source": source, "query": query or None}
 
 
 if __name__ == "__main__":
@@ -125,9 +146,11 @@ if __name__ == "__main__":
     p.add_argument("--count", type=int, default=200)
     p.add_argument("--source", default="picsum", choices=["picsum", "pexels", "unsplash"])
     p.add_argument("--key", default=None)
+    p.add_argument("--query", default=None,
+                   help='pexels/unsplash only, e.g. "portrait woman model bikini"')
     p.add_argument("--out", default=CLEAN_DIR)
     a = p.parse_args()
     logging.basicConfig(level=logging.INFO)
-    info = download(a.count, a.out, source=a.source, api_key=a.key,
+    info = download(a.count, a.out, source=a.source, api_key=a.key, query=a.query,
                     progress_cb=lambda p, n: print(f"\r{n}/{a.count}", end=""))
     print("\n", info)
