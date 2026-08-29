@@ -103,6 +103,7 @@ export default function HomePage() {
   const [removeText, setRemoveText] = useState(false);
   // Processing tier: fast (LaMa, nhẹ) · smart (AI đã train) · pro (SDXL, ảnh khó).
   const [procMode, setProcMode] = useState<"fast" | "smart" | "pro">("smart");
+  const [maskPreviewUrl, setMaskPreviewUrl] = useState<string | null>(null);
   // Session refine ("Xóa thêm vùng"): brush leftover spots on the result; each
   // pass re-erases from the pristine server-side original (no cumulative blur).
   const [refining, setRefining] = useState(false);
@@ -161,6 +162,10 @@ export default function HomePage() {
     });
     setActiveId(null);
     setZipUrl((prev) => {
+      revoke(prev);
+      return null;
+    });
+    setMaskPreviewUrl((prev) => {
       revoke(prev);
       return null;
     });
@@ -630,6 +635,29 @@ export default function HomePage() {
     (items.length === 1 && items[0].resultUrl ? items[0].resultUrl : zipUrl);
   const downloadName = zipUrl || isBatch ? "clearmark-batch.zip" : "clearmark-result.png";
 
+  const showMaskPreview = async () => {
+    if (!active || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append("image", active.file);
+      form.append("remove_text", removeText ? "1" : "0");
+      form.append("mode", procMode);
+      const res = await fetch("/api/debug-masks", { method: "POST", body: form });
+      if (!res.ok) throw new Error(await readErrorDetail(res));
+      const blob = await res.blob();
+      setMaskPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(blob);
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Không xem được mask.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="min-h-screen">
       <header className="mx-auto flex max-w-5xl items-center justify-between px-5 py-5">
@@ -986,6 +1014,17 @@ export default function HomePage() {
                   </p>
                 )}
 
+                {maskPreviewUrl && (
+                  <div className="overflow-hidden rounded-xl border" style={{ borderColor: "var(--line)" }}>
+                    <p className="px-3 py-2 text-xs text-[var(--ink-muted)]">
+                      Mask sẽ xóa: vàng = người (không LaMa) · đỏ = nét peel · xanh lá = LaMa nền · xanh dương = chỉ cân màu.
+                      Nếu vàng phủ bikini thì LaMa không được đụng vùng đó.
+                    </p>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={maskPreviewUrl} alt="Mask trước khi xóa" className="mx-auto max-h-[420px] w-full object-contain bg-black/5" />
+                  </div>
+                )}
+
                 {mode === "auto" && (
                   <div className="flex flex-wrap gap-2">
                     {([
@@ -1038,6 +1077,17 @@ export default function HomePage() {
                         ? `Xử lý ${items.length} ảnh`
                         : "Xử lý bằng AI"}
                   </button>
+                  {mode === "auto" && !isBatch && (
+                    <button
+                      type="button"
+                      disabled={busy || !active}
+                      onClick={showMaskPreview}
+                      className="rounded-xl px-4 py-2.5 text-sm font-semibold disabled:opacity-60"
+                      style={{ background: "#f3ebe4", color: "var(--ink)" }}
+                    >
+                      Xem mask trước khi xóa
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import IgnoreExtErrors from "./ignore-ext-errors";
 
 export const metadata: Metadata = {
   title: "ClearMark — Xóa Watermark Ảnh Online",
@@ -14,7 +15,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="vi">
-      <body className="antialiased">{children}</body>
+      <body className="antialiased">
+        <IgnoreExtErrors />
+        {children}
+      </body>
     </html>
   );
 }

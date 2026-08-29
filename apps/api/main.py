@@ -194,7 +194,7 @@ async def manual_inpaint(
 
     try:
         # A brushed mask is the user's explicit intent — remove exactly that.
-        result = engine.erase(original, mask_img, trusted=mask_img)
+        result = engine.erase(original, mask_img, trusted=mask_img, manual=mask_img)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -224,21 +224,32 @@ async def debug_masks(
     mode: Optional[str] = Form(default="smart"),
 ):
     """
-    Debug overlay of the removal routing:
-      red = thin ink (peel), green = small solid (inpaint), blue = wide (de-tint only).
+    Overlay of the mask that will actually be used to erase:
+      yellow = person zone (never LaMa)
+      red    = ink / peel
+      green  = LaMa (background only)
+      blue   = tint-only
     """
     import cv2
     from services.ink import classify
+    from services.mask_prep import person_zone, prepare_removal_mask
 
     raw = await _read_upload(image, "ảnh")
     original = _load_image(raw)
     rgb = np.asarray(original.convert("RGB"))
     wm = engine.detect_mask(original, _truthy(remove_text), mode=mode or "smart")
-    m = np.asarray(wm.convert("L"))
+    prepared = prepare_removal_mask(wm, size=original.size, mode=mode or "smart", rgb=original)
+    m = np.asarray(prepared.convert("L"))
     _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+    person = person_zone(rgb, dilate_px=8)
     thin, solid, wide = classify(rgb, m)
+    solid[person > 0] = 0
+    wide[person > 0] = 0
 
-    vis = rgb.copy()
+    vis = rgb.copy().astype(np.float32)
+    y = person > 0
+    vis[y] = vis[y] * 0.65 + np.array([40, 180, 220], np.float32) * 0.35
+    vis = vis.astype(np.uint8)
     vis[wide > 0] = [40, 80, 230]
     vis[solid > 0] = [40, 200, 60]
     vis[thin > 0] = [230, 40, 40]
@@ -250,6 +261,7 @@ async def debug_masks(
             "X-ClearMark-Thin": str(int((thin > 0).sum())),
             "X-ClearMark-Solid": str(int((solid > 0).sum())),
             "X-ClearMark-Wide": str(int((wide > 0).sum())),
+            "X-ClearMark-Person": str(int((person > 0).sum())),
         },
     )
 
@@ -324,6 +336,7 @@ async def session_erase(
             original,
             Image.fromarray(acc, mode="L"),
             trusted=Image.fromarray(brushed, mode="L") if brushed is not None else None,
+            manual=Image.fromarray(brushed, mode="L") if brushed is not None else None,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

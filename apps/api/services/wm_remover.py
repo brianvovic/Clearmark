@@ -85,7 +85,7 @@ def remove(image: Image.Image, mask: Image.Image | None) -> Image.Image:
     from services.mask_prep import prepare_removal_mask
 
     if mask is not None:
-        m = prepare_removal_mask(mask, size=(W, H), dilate_px=8)
+        m = prepare_removal_mask(mask, size=(W, H), mode="smart", rgb=rgb)
         m_small = cv2.resize(np.array(m), (_size, _size), interpolation=cv2.INTER_NEAREST)
         m_t = torch.from_numpy((m_small > 127).astype("float32")).unsqueeze(0)
     else:

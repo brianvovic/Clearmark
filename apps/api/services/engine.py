@@ -253,6 +253,7 @@ def erase(
     *,
     remove_text: bool = False,
     trusted: Image.Image | None = None,
+    manual: Image.Image | None = None,
 ) -> Image.Image:
     """
     Removal routed by what the masked pixels actually are:
@@ -263,37 +264,41 @@ def erase(
 
     A wrong mask can therefore dim a region, but can never repaint a person.
     """
-    from services.attenuate import erase_ink, smooth_fill
+    from services.attenuate import erase_ink, peel_overlay, smooth_fill
     from services.ink import (
         classify,
         correct_tint,
         ink_within,
         promote_matching_ink,
+        revert_worn_garments,
         split_by_surround_texture,
     )
     from services.mask import _apply_face_protection
-    from services.mask_prep import prepare_removal_mask
+    from services.mask_prep import person_zone, prepare_removal_mask
 
     rgb = np.asarray(original.convert("RGB"))
 
-    mask = prepare_removal_mask(mask, size=original.size, mode=mode, rgb=None)
+    mask = prepare_removal_mask(mask, size=original.size, mode=mode, rgb=original)
     m = np.asarray(mask.convert("L"))
     _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
     m = _apply_face_protection(m, rgb)
     if m.max() < 128:
         return original.convert("RGB")
 
+    def _binarize(img: Image.Image | None) -> np.ndarray:
+        if img is None:
+            return np.zeros_like(m)
+        a = np.asarray(img.convert("L"))
+        if a.shape != m.shape:
+            a = cv2.resize(a, (m.shape[1], m.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return cv2.threshold(a, 127, 255, cv2.THRESH_BINARY)[1]
+
+    hand = cv2.bitwise_and(_binarize(manual), m)
+
     # Stroke-accurate masks (brush, colour detector, OCR) are removed as drawn;
     # everything else has to show ink first.
-    if trusted is not None:
-        t = np.asarray(trusted.convert("L"))
-        if t.shape != m.shape:
-            t = cv2.resize(t, (m.shape[1], m.shape[0]), interpolation=cv2.INTER_NEAREST)
-        _, t = cv2.threshold(t, 127, 255, cv2.THRESH_BINARY)
-        t = _apply_face_protection(t, rgb)
-        t = cv2.bitwise_and(t, m)
-    else:
-        t = np.zeros_like(m)
+    t = cv2.bitwise_and(_apply_face_protection(_binarize(trusted), rgb), m) \
+        if trusted is not None else np.zeros_like(m)
 
     guess = cv2.bitwise_and(m, cv2.bitwise_not(t))
     if t.max() and guess.max():
@@ -313,28 +318,56 @@ def erase(
         thin = cv2.bitwise_or(thin, t_thin)
         solid = cv2.bitwise_or(solid, t_solid)
         wide = cv2.bitwise_or(wide, t_wide)
+
+    # Never hole-fill a person. Manual brush is the only exception.
+    person = person_zone(rgb, dilate_px=8)
+    if hand.max():
+        person = cv2.bitwise_and(person, cv2.bitwise_not(hand))
+    on_body = cv2.bitwise_or(solid, wide)
+    on_body[person == 0] = 0
+    if on_body.max():
+        body_ink = ink_within(rgb, on_body, min_delta=8.0)
+        thin = cv2.bitwise_or(thin, body_ink)
+        solid[person > 0] = 0
+        wide[person > 0] = 0
+        logger.info("body diverted from LaMa: %d px → peel/ink", int((on_body > 0).sum()))
+
     out = rgb.copy()
 
     # 1) Translucent panels / bands — flatten the tint, keep every detail
     if wide.max():
         out = correct_tint(out, wide)
 
-    # 2) Ink — fill the strokes themselves, then re-measure what is still painted on
+    # 2) Body first: peel overlay (generic deblend, not hoalau-only)
+    body_thin = np.zeros_like(thin)
     if thin.max():
+        body_thin = thin.copy()
+        body_thin[person == 0] = 0
+        if body_thin.max():
+            strength = {"fast": 1.05, "smart": 1.2, "pro": 1.3}.get(mode, 1.15)
+            if remove_text:
+                strength = min(1.4, strength + 0.1)
+            out = peel_overlay(out, body_thin, strength=strength)
         radius = 2 if mode == "fast" else 3
+        bg_thin = thin.copy()
+        bg_thin[person > 0] = 0
         area0 = max(1, int((thin > 0).sum()))
-        out = erase_ink(out, thin, radius=radius)
+        if bg_thin.max():
+            out = erase_ink(out, bg_thin, radius=radius)
+        resid_body = ink_within(out, body_thin if body_thin.max() else thin, min_delta=9.0)
+        resid_body[person == 0] = 0
+        if resid_body.max():
+            out = erase_ink(out, resid_body, radius=2)
 
         rounds = 1 if mode == "fast" else (2 if mode == "smart" else 3)
+        seed = bg_thin if bg_thin.max() else thin
         for _ in range(rounds):
-            # Ink is re-detected against the local texture level, so this loop
-            # stops as soon as only photo detail is left (no runaway blurring).
-            resid = ink_within(out, thin, min_delta=9.0)
+            resid = ink_within(out, seed, min_delta=9.0)
             left = int((resid > 0).sum())
             if left == 0 or left < 0.02 * area0:
                 break
-            # Opaque leftovers carry no recoverable texture — fill those strokes
             out = erase_ink(out, resid, radius=radius)
+            seed = resid
         logger.info("ink handled (%d px)", area0)
 
     # 3) Compact blobs — the only path allowed to invent pixels
@@ -392,7 +425,7 @@ def erase(
         sel = solid > 0
         out[sel] = filled[sel]
 
-    return Image.fromarray(out)
+    return Image.fromarray(revert_worn_garments(rgb, out, keep=hand))
 
 
 def _maybe_sharpen(img: Image.Image, mask: Image.Image) -> Image.Image:

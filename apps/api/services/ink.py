@@ -31,6 +31,119 @@ FILL_MAX_FRAC = 0.06      # no guessed blob larger than this may ever be filled
 TRUSTED_FILL_MAX_FRAC = 0.04  # thick brushed / colour-detected blobs, no ink proof
 
 
+GARMENT_MIN_FRAC = 0.003   # smaller than this on skin is a sticker, not clothing
+GARMENT_RING_SKIN = 0.70   # clothing is enclosed by skin; a watermark rarely is
+GARMENT_BODY_FRAC = 0.30   # garment thickness, as a share of the body's own width
+GARMENT_MIN_THICK = 18.0   # …but never call anything thinner than this clothing
+
+
+def skin_mask(rgb: np.ndarray) -> np.ndarray:
+    """Skin tone in YCrCb, cleaned of speckle. uint8 {0,255}."""
+    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+    skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 175, 130))
+    skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    return cv2.morphologyEx(skin, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+
+
+def garment_thickness(skin: np.ndarray) -> float:
+    """
+    How thick a blob must be before it can be clothing, in pixels.
+
+    Scaled to the person: a swimsuit is a sizeable fraction of the torso it
+    covers, while lettering is hairline whatever the resolution. Judging in
+    absolute pixels would either spare bold text or condemn a small bikini.
+    """
+    h, w = skin.shape[:2]
+    k = _odd(int(min(h, w) * 0.03), 5, 61)
+    body = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+
+    # Close the openings clothing leaves in the skin silhouette, so the torso is
+    # measured whole instead of as two separate strips of bare skin. Holes are
+    # the gaps that do not reach the frame edge.
+    gaps = (body == 0).astype(np.uint8)
+    n, labels = cv2.connectedComponents(gaps, connectivity=8)
+    if n > 1:
+        edge = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+        holes = np.isin(labels, edge[edge != 0], invert=True) & (gaps > 0)
+        body = cv2.bitwise_or(body, holes.astype(np.uint8) * 255)
+
+    # Pad with an empty border, else a body filling the frame has no zero pixel
+    # to measure against and the distance transform runs away to infinity.
+    padded = cv2.copyMakeBorder((body > 0).astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    radius = float(cv2.distanceTransform(padded, cv2.DIST_L2, 3).max())
+    radius = min(radius, 0.5 * min(h, w))
+    return max(GARMENT_MIN_THICK, GARMENT_BODY_FRAC * radius)
+
+
+GARMENT_SOLID_FILL = 0.70  # a garment is opaque; lettering leaves photo between glyphs
+
+
+def revert_worn_garments(
+    before: np.ndarray,
+    after: np.ndarray,
+    *,
+    keep: np.ndarray | None = None,
+    delta: float = 6.0,
+) -> np.ndarray:
+    """
+    Undo edits that turned clothing into skin, whatever produced them.
+
+    Every route — stroke fill, tint, LaMa, SDXL — ends here, so instead of
+    guarding each one we look at what actually changed: a compact opaque patch
+    on a body that the pass rewrote is a swimsuit, while a watermark leaves a
+    lacework of strokes with the photo still showing between them. ``keep``
+    marks pixels the user painted by hand, which are never rolled back.
+    """
+    diff = np.abs(after.astype(np.int16) - before.astype(np.int16)).max(axis=2)
+    changed = (diff > delta).astype(np.uint8) * 255
+    if keep is not None:
+        changed = cv2.bitwise_and(changed, cv2.bitwise_not(keep))
+    if changed.max() == 0:
+        return after
+
+    skin = skin_mask(before) > 0
+    if float(skin.mean()) < 0.05:
+        return after
+
+    img_area = float(before.shape[0] * before.shape[1])
+    min_thick = garment_thickness(skin_mask(before))
+    # Close across the gaps between letters so a word is judged as one mark.
+    clusters = cv2.morphologyEx(
+        changed, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    )
+    ring_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (29, 29))
+    out = after.copy()
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((clusters > 0).astype(np.uint8), 8)
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < GARMENT_MIN_FRAC * img_area:
+            continue
+        comp = (labels == i).astype(np.uint8) * 255
+        sel = comp > 0
+        # Thickness of what was actually rewritten, not of the closed cluster:
+        # a word closes into one fat blob, yet every stroke in it stays hairline.
+        local = cv2.bitwise_and(changed, comp)
+        if float(cv2.distanceTransform(local // 255, cv2.DIST_L2, 3).max() * 2) <= min_thick:
+            continue
+        if float((changed[sel] > 0).mean()) < GARMENT_SOLID_FILL:
+            continue  # strokes with photo between them — a real watermark
+        bw, bh = int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])
+        if max(bw, bh) > 3.5 * max(1, min(bw, bh)):
+            continue  # a long thin band is a line of text, not a garment
+        if float(skin[sel].mean()) > 0.5:
+            continue
+        ring = (cv2.dilate(comp, ring_k, 1) > 0) & (~sel)
+        if ring.sum() < 80 or float(skin[ring].mean()) < GARMENT_RING_SKIN:
+            continue
+        out[sel] = before[sel]
+        logger.info(
+            "revert worn garment: %d px repainted on a body (%.0f%% skin around it)",
+            int((changed[sel] > 0).sum()), 100.0 * float(skin[ring].mean()),
+        )
+    return out
+
+
 def _odd(v: int, lo: int = 3, hi: int = 61) -> int:
     v = int(max(lo, min(hi, v)))
     return v if v % 2 == 1 else v + 1

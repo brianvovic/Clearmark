@@ -17,7 +17,6 @@ import os
 import random
 
 import numpy as np
-from PIL import Image
 
 from training.checkpoints import resolve_resume, save_epoch
 from training.pipeline import IMG_SIZE, _list_clean, load_wm_assets, synthesize
@@ -162,54 +161,49 @@ class _LpipsLoss:
 
 
 def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = None,
-                  epochs: int = 10, batch: int = 6, progress_cb=None, epoch_cb=None,
+                  epochs: int = 10, batch: int | None = None, progress_cb=None, epoch_cb=None,
                   target_epochs: int | None = None, base_epochs: int | None = None) -> dict:
     import torch
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader, Dataset
+
+    from training.fastload import ThreadedBatches, tune_backend
+    from training.pipeline import load_clean_rgb
 
     assets = load_wm_assets()
     files = _list_clean(clean_dir)
     if len(files) < 4:
         raise ValueError("Cần ít nhất vài ảnh sạch để train.")
     base_rng = random.Random(4321)
+    try:
+        from training import hard_neg
 
-    class DS(Dataset):
-        def __init__(self, paths, n):
-            self.paths, self.n = paths, n
-            try:
-                from training import hard_neg
+        hard = hard_neg.list_cases(400)
+    except Exception:  # noqa: BLE001
+        hard = []
 
-                self.hard = hard_neg.list_cases(400)
-            except Exception:  # noqa: BLE001
-                self.hard = []
+    def make(i: int):
+        if hard and (i % 10) < 3:
+            from training import hard_neg
 
-        def __len__(self):
-            return self.n
+            wp, mp, cp = hard[i % len(hard)]
+            wm, mask, clean = hard_neg.load_case(wp, mp, cp, IMG_SIZE)
+        else:
+            clean = load_clean_rgb(files[base_rng.randrange(len(files))], IMG_SIZE)
+            wm, mask = synthesize(clean, assets, random.Random(random.getrandbits(32)),
+                                  augment=False)
+        rgb = torch.from_numpy(np.ascontiguousarray(wm)).permute(2, 0, 1).float() / 255.0
+        mch = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0)
+        x = torch.cat([rgb, mch], dim=0)
+        y = torch.from_numpy(np.ascontiguousarray(clean)).permute(2, 0, 1).float() / 255.0
+        w = mch * 6 + 1
+        return x, y, w
 
-        def __getitem__(self, i):
-            import torch
-
-            if self.hard and (i % 10) < 3:
-                from training import hard_neg
-
-                wp, mp, cp = self.hard[i % len(self.hard)]
-                wm, mask, clean = hard_neg.load_case(wp, mp, cp, IMG_SIZE)
-            else:
-                p = self.paths[i % len(self.paths)]
-                clean = np.array(Image.open(p).convert("RGB").resize((IMG_SIZE, IMG_SIZE)))
-                wm, mask = synthesize(clean, assets, random.Random(i * 11 + base_rng.randint(0, 1 << 20)),
-                                      augment=False)
-            rgb = torch.from_numpy(wm).permute(2, 0, 1).float() / 255.0
-            mch = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0)
-            x = torch.cat([rgb, mch], dim=0)
-            y = torch.from_numpy(clean).permute(2, 0, 1).float() / 255.0
-            w = mch * 6 + 1
-            return x, y, w
-
-    steps_per = max(2, min(len(files) * 3, 6000) // batch)
-    dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    batch = int(batch or os.getenv("TRAIN_BATCH_REMOVAL", os.getenv("TRAIN_BATCH", "8")))
+    steps_per = max(2, min(len(files) * 2, 1600) // batch)
+    dl = ThreadedBatches(make, steps_per * batch, batch, depth=8)
+    dev = tune_backend()
+    amp = dev == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     net = build_removal_net(4).to(dev)
     disc = build_discriminator().to(dev)
     lpips_fn = _LpipsLoss(dev)
@@ -257,32 +251,38 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
     for ep in range(epochs):
         run = 0.0
         for x, y, w in dl:
-            x, y, w = x.to(dev), y.to(dev), w.to(dev)
+            x = x.to(dev, non_blocking=True)
+            y = y.to(dev, non_blocking=True)
+            w = w.to(dev, non_blocking=True)
 
             # ---- Generator ----
-            opt.zero_grad()
-            pred = net(x)
-            l1 = (torch.abs(pred - y) * w).mean()
-            # LPIPS on full image — forces texture / sharpness vs lazy blur
-            perc = lpips_fn(pred, y)
-            fake_logits = disc(pred)
-            gan_g = F.binary_cross_entropy_with_logits(
-                fake_logits, torch.ones_like(fake_logits)
-            )
-            loss_g = _L1_W * l1 + _LPIPS_W * perc + _GAN_W * gan_g
-            loss_g.backward()
-            opt.step()
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                pred = net(x)
+                l1 = (torch.abs(pred - y) * w).mean()
+                # LPIPS on full image — forces texture / sharpness vs lazy blur
+                perc = lpips_fn(pred, y)
+                fake_logits = disc(pred)
+                gan_g = F.binary_cross_entropy_with_logits(
+                    fake_logits, torch.ones_like(fake_logits)
+                )
+                loss_g = _L1_W * l1 + _LPIPS_W * perc + _GAN_W * gan_g
+            scaler.scale(loss_g).backward()
+            scaler.step(opt)
 
             # ---- Discriminator ----
-            opt_d.zero_grad()
-            real_logits = disc(y.detach())
-            fake_logits_d = disc(pred.detach())
-            loss_d = 0.5 * (
-                F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
-                + F.binary_cross_entropy_with_logits(fake_logits_d, torch.zeros_like(fake_logits_d))
-            )
-            loss_d.backward()
-            opt_d.step()
+            opt_d.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                real_logits = disc(y.detach())
+                fake_logits_d = disc(pred.detach())
+                loss_d = 0.5 * (
+                    F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+                    + F.binary_cross_entropy_with_logits(fake_logits_d,
+                                                         torch.zeros_like(fake_logits_d))
+                )
+            scaler.scale(loss_d).backward()
+            scaler.step(opt_d)
+            scaler.update()
 
             run += float(loss_g.item())
             step += 1

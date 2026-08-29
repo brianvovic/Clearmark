@@ -507,8 +507,8 @@ export default function TrainPage() {
           <p className="mb-1.5 text-xs font-semibold text-[var(--ink-muted)]">Loại AI muốn train:</p>
           <div className="flex flex-wrap gap-2">
             {([
-              { id: "detector", label: "Detector — tìm watermark", hint: "nhẹ, nhanh, chuẩn; rồi LaMa xóa" },
-              { id: "removal", label: "Removal — xóa & dựng nền", hint: "nặng, cần nhiều dữ liệu" },
+              { id: "detector", label: "Detector — tìm watermark", hint: "ưu tiên bây giờ · nhẹ, nhanh" },
+              { id: "removal", label: "Removal — xóa & dựng nền", hint: "tạm dừng · dùng checkpoint tốt" },
             ] as const).map((k) => (
               <button
                 key={k.id}
@@ -523,6 +523,11 @@ export default function TrainPage() {
               </button>
             ))}
           </div>
+          {kind === "removal" && (
+            <p className="mt-2 text-xs text-[var(--ink-muted)]">
+              Xóa nhòe bikini không do Removal. Hãy train Detector. Chỉ train lại Removal khi IoU Detector &gt; 0.65.
+            </p>
+          )}
         </div>
         {hasModel && (
           <p className="mb-3 text-sm">

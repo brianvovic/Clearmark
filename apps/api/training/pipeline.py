@@ -298,9 +298,20 @@ def _list_clean(clean_dir: str) -> list[str]:
     return files
 
 
+def load_clean_rgb(path: str, size: int = IMG_SIZE) -> np.ndarray:
+    """Decode a training photo straight to training resolution."""
+    img = Image.open(path)
+    # Ask libjpeg for a DCT-scaled decode: a 4000px stock photo costs ~1/8 as
+    # much when all we keep is 384px. Silently ignored for png/webp.
+    try:
+        img.draft("RGB", (size, size))
+    except Exception:  # noqa: BLE001
+        pass
+    return np.array(img.convert("RGB").resize((size, size), Image.BILINEAR))
+
+
 def make_sample(clean_path: str, assets: list[np.ndarray], rng: random.Random):
-    img = Image.open(clean_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
-    clean = np.array(img)
+    clean = load_clean_rgb(clean_path)
     if rng.random() < 0.12:  # clean negative → fewer false positives
         return clean, np.zeros((IMG_SIZE, IMG_SIZE), np.uint8)
     return synthesize(clean, assets, rng)
@@ -374,52 +385,51 @@ def _build_unet():
 
 
 def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
-          epochs: int = 8, batch: int = 8, progress_cb=None, epoch_cb=None,
+          epochs: int = 8, batch: int | None = None, progress_cb=None, epoch_cb=None,
           target_epochs: int | None = None, base_epochs: int | None = None) -> dict:
     import torch
-    from torch.utils.data import DataLoader, Dataset
 
     from training.checkpoints import read_status, resolve_resume, save_epoch, write_status
+    from training.fastload import ThreadedBatches, tune_backend
 
     assets = load_wm_assets()
     files = _list_clean(clean_dir)
     if len(files) < 4:
         raise ValueError("Cần ít nhất vài ảnh sạch để train.")
     base_rng = random.Random(1234)
+    try:
+        from training import hard_neg
 
-    class DS(Dataset):
-        def __init__(self, paths, n):
-            self.paths, self.n = paths, n
-            try:
-                from training import hard_neg
+        hard = hard_neg.list_cases(400)
+    except Exception:  # noqa: BLE001
+        hard = []
 
-                self.hard = hard_neg.list_cases(400)
-            except Exception:  # noqa: BLE001
-                self.hard = []
+    def make(i: int):
+        # ~30% hard-neg oversample when the bank has failures from kiểm chứng
+        if hard and (i % 10) < 3:
+            from training import hard_neg
 
-        def __len__(self):
-            return self.n
+            wp, mp, _cp = hard[i % len(hard)]
+            img, mask, _ = hard_neg.load_case(wp, mp, _cp, IMG_SIZE)
+        else:
+            p = files[base_rng.randrange(len(files))]
+            img, mask = make_sample(p, assets, random.Random(random.getrandbits(32)))
+        x = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1).float() / 255.0
+        y = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
+        return x, y
 
-        def __getitem__(self, i):
-            # ~30% hard-neg oversample when the bank has failures from kiểm chứng
-            if self.hard and (i % 10) < 3:
-                from training import hard_neg
-
-                wp, mp, _cp = self.hard[i % len(self.hard)]
-                img, mask, _ = hard_neg.load_case(wp, mp, _cp, IMG_SIZE)
-            else:
-                p = self.paths[i % len(self.paths)]
-                img, mask = make_sample(p, assets, random.Random(i * 7 + base_rng.randint(0, 1 << 20)))
-            x = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-            y = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
-            return x, y
-
+    batch = int(batch or os.getenv("TRAIN_BATCH", "16"))
     # ~1 pass over the data per epoch (capped) so epochs finish fast on big sets
     # and each is checkpointed — better than one giant slow epoch.
-    steps_per = max(2, min(len(files) * 3, 6000) // batch)
-    dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    steps_per = max(2, min(len(files) * 2, 2000) // batch)
+    dl = ThreadedBatches(make, steps_per * batch, batch, depth=8)
+    dev = tune_backend()
+    amp = dev == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     net = _build_unet().to(dev)
+    if amp:
+        # NHWC feeds the tensor cores directly instead of transposing per conv
+        net = net.to(memory_format=torch.channels_last)
 
     if not resume_from:
         resume_from, _ = resolve_resume("detector", out_path, fresh=False)
@@ -461,12 +471,17 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
     for ep in range(epochs):
         run = 0.0
         for x, y in dl:
-            x, y = x.to(dev), y.to(dev)
-            opt.zero_grad()
-            out = net(x)
-            loss = bce(out, y) + dice(out, y)
-            loss.backward()
-            opt.step()
+            x = x.to(dev, non_blocking=True)
+            y = y.to(dev, non_blocking=True)
+            if amp:
+                x = x.contiguous(memory_format=torch.channels_last)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                out = net(x)
+                loss = bce(out, y) + dice(out, y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             run += float(loss.item())
             step += 1
             if progress_cb and step % 2 == 0:

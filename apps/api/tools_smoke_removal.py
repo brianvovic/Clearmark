@@ -16,6 +16,12 @@ import numpy as np
 from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+# Error messages are Vietnamese; a cp1252 console would abort the run on them.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 
 from services import engine  # noqa: E402
 
@@ -78,9 +84,49 @@ def _detail(x: np.ndarray) -> float:
     return float(cv2.Laplacian(g, cv2.CV_32F).var())
 
 
+def _body_with_bikini() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Skin-toned torso wearing a cyan swimsuit, with pink text stamped on it.
+
+    This is the regression for the worst bug the app had: the colour detector
+    reads a saturated swimsuit as a neon logo, and the fill paints skin over it.
+    """
+    rng = np.random.default_rng(3)
+    body = np.zeros((512, 512, 3), np.float32)
+    body[..., 0], body[..., 1], body[..., 2] = 226.0, 176.0, 152.0
+    body += rng.normal(0, 4.0, body.shape)
+    body *= np.linspace(0.85, 1.05, 512, dtype=np.float32)[None, :, None]
+    body = np.clip(body, 0, 255).astype(np.uint8)
+
+    suit = np.zeros((512, 512), np.uint8)
+    cv2.ellipse(suit, (256, 170), (95, 55), 0, 0, 360, 255, -1)
+    cv2.ellipse(suit, (256, 390), (80, 48), 0, 0, 360, 255, -1)
+    body[suit > 0] = (40, 190, 205)
+
+    wm, gt = _stamp_text(body, alpha=0.75)
+    return wm, body, suit, gt
+
+
+def check_garment() -> bool:
+    wm, clean, suit, gt = _body_with_bikini()
+    out = np.asarray(engine.erase_auto(Image.fromarray(wm), True, mode="smart").convert("RGB"))
+
+    worn = (suit > 0) & (gt == 0)
+    change = float(np.abs(out[worn].astype(int) - wm[worn].astype(int)).mean())
+    sel = gt > 0
+    before = _ink_left(wm, clean, sel)
+    after = _ink_left(out, clean, sel)
+    removed = 100.0 * (1.0 - after / max(before, 1e-3)) if before > 1 else 0.0
+    print(f"[garment] swimsuit_change={change:5.1f} text_removed={removed:5.1f}%")
+    good = True
+    if change > 12:
+        good = False
+        print("   !! the swimsuit was repainted")
+    return good
+
+
 def main() -> int:
     files = _photos(3)
-    ok = True
+    ok = check_garment()
 
     for path in files:
         clean = _load(path)

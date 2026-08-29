@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-DEFAULT_DILATE_PX = 4
+DEFAULT_DILATE_PX = 3
 
 
 def _stroke_thickness_px(binary: np.ndarray) -> float:
@@ -43,12 +43,48 @@ def smart_dilate_px(binary: np.ndarray, *, base: int = DEFAULT_DILATE_PX,
         px = 3
 
     if mode in ("fast", "safe"):
-        px = max(2, px - 1)
+        px = max(1, px - 2)
     elif mode in ("pro", "aggressive", "4.0"):
-        px = max(2, min(4, px - 1))  # tightest for diffusion
+        px = max(1, min(3, px - 1))
     elif mode == "smart":
-        px = max(2, min(5, px))
+        px = max(1, min(3, px - 1))
     return int(px)
+
+
+def person_zone(rgb: np.ndarray, *, dilate_px: int = 8) -> np.ndarray:
+    """
+    Body + clothing sitting in skin holes (bikini, underwear).
+
+    Skin-tone alone misses white fabric; those holes in the silhouette *are*
+    the swimsuit. Closing them and growing a few pixels keeps LaMa off both
+    skin and the garment next to it.
+    """
+    from services.mask import protect_mask
+
+    skin = protect_mask(rgb)
+    h, w = skin.shape[:2]
+    k = max(5, int(min(h, w) * 0.03))
+    if k % 2 == 0:
+        k += 1
+    body = cv2.morphologyEx(
+        skin, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    )
+    gaps = (body == 0).astype(np.uint8)
+    n, labels = cv2.connectedComponents(gaps, connectivity=8)
+    if n > 1:
+        edge = np.unique(
+            np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
+        )
+        holes = np.isin(labels, edge[edge != 0], invert=True) & (gaps > 0)
+        body = cv2.bitwise_or(body, holes.astype(np.uint8) * 255)
+    if dilate_px > 0:
+        d = dilate_px * 2 + 1
+        if d % 2 == 0:
+            d += 1
+        body = cv2.dilate(
+            body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d)), 1
+        )
+    return body
 
 
 def apply_subject_guard(
@@ -60,18 +96,15 @@ def apply_subject_guard(
     """
     Prevent inpaint from erasing people:
       • Face / head boxes → always cleared from the mask
-      • Body skin → keep only a slightly eroded core (drop dilate halo on skin)
-    Watermark text sitting ON skin is still removed (core stays); clothing next
-    to skin is no longer swallowed by a fat halo.
+      • Body + swimsuit holes → keep only verified ink strokes (never a fat blob)
     """
-    from services.mask import protect_mask, _get_face_cascades
+    from services.mask import _get_face_cascades
 
     out = mask.copy()
     if out.max() == 0:
         return out
 
     h, w = rgb.shape[:2]
-    # --- Hard face protect ---
     face = np.zeros((h, w), np.uint8)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     for c in _get_face_cascades():
@@ -92,25 +125,42 @@ def apply_subject_guard(
             )
     if face.max():
         out[face > 0] = 0
+        if out.max() == 0:
+            return out
 
-    # Soft body-skin: shrink dilate halo only (1 iter) — never wipe text cores
-    keep = protect_mask(rgb)
-    skin = keep.copy()
-    skin[face > 0] = 0
-    if skin.max() == 0 or out.max() == 0:
+    person = person_zone(rgb, dilate_px=8)
+    person[face > 0] = 255
+    on_person = (out > 0) & (person > 0)
+    if not on_person.any():
         return out
 
-    on_skin = (out > 0) & (skin > 0)
-    if not on_skin.any():
-        return out
+    body = np.where(on_person, out, 0).astype(np.uint8)
 
-    iters = 1  # was 2 — erased thin "gaigu" strokes on chest
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    eroded = cv2.erode(out, k, iterations=iters)
-    # If erode wiped the on-skin core, keep original on-skin pixels
-    if not ((eroded > 0) & (skin > 0)).any() and on_skin.any():
-        return out
-    out = np.where(skin > 0, eroded, out).astype(np.uint8)
+    try:
+        from services.ink import THIN_THICK_PX, ink_within
+
+        kept = ink_within(rgb, body, min_delta=8.0, require_uniform=False)
+        if kept.max():
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(
+                (kept > 0).astype(np.uint8), connectivity=8
+            )
+            thin_only = np.zeros_like(kept)
+            for i in range(1, n):
+                if int(stats[i, cv2.CC_STAT_AREA]) < 6:
+                    continue
+                comp = (labels == i).astype(np.uint8)
+                dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
+                thick = float(dist.max() * 2.0) if dist.size else 0.0
+                if thick <= THIN_THICK_PX:
+                    thin_only[comp > 0] = 255
+            kept = thin_only
+    except Exception:  # noqa: BLE001
+        kept = np.zeros_like(body)
+
+    if kept.max() == 0:
+        kept = np.zeros_like(body)  # no verified ink → do not fill the garment
+
+    out = np.where(person > 0, kept, out).astype(np.uint8)
     _, out = cv2.threshold(out, 127, 255, cv2.THRESH_BINARY)
     return out
 
@@ -138,21 +188,35 @@ def prepare_removal_mask(
 
     _, binary = cv2.threshold(arr.astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
 
+    rgb_arr: np.ndarray | None = None
+    if rgb is not None:
+        rgb_arr = np.array(rgb.convert("RGB")) if isinstance(rgb, Image.Image) else rgb
+        if rgb_arr.shape[0] != binary.shape[0] or rgb_arr.shape[1] != binary.shape[1]:
+            rgb_arr = cv2.resize(
+                rgb_arr, (binary.shape[1], binary.shape[0]), interpolation=cv2.INTER_AREA
+            )
+
     px = dilate_px if dilate_px is not None else smart_dilate_px(binary, mode=mode)
     if px > 0 and binary.max() > 0:
         k = max(3, int(px) * 2 + 1)
         if k % 2 == 0:
             k += 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-        binary = cv2.dilate(binary, kernel, iterations=1)
+        if rgb_arr is not None:
+            # Grow background blobs only — dilating on a body swallows bikini/skin
+            person = person_zone(rgb_arr, dilate_px=8)
+            bg = binary.copy()
+            bg[person > 0] = 0
+            bg = cv2.dilate(bg, kernel, iterations=1)
+            body = binary.copy()
+            body[person == 0] = 0
+            binary = cv2.bitwise_or(bg, body)
+        else:
+            binary = cv2.dilate(binary, kernel, iterations=1)
 
     _, binary = cv2.threshold(binary, 127, 255, cv2.THRESH_BINARY)
 
-    if rgb is not None:
-        if isinstance(rgb, Image.Image):
-            rgb = np.array(rgb.convert("RGB"))
-        if rgb.shape[0] != binary.shape[0] or rgb.shape[1] != binary.shape[1]:
-            rgb = cv2.resize(rgb, (binary.shape[1], binary.shape[0]), interpolation=cv2.INTER_AREA)
-        binary = apply_subject_guard(binary, rgb, mode=mode)
+    if rgb_arr is not None:
+        binary = apply_subject_guard(binary, rgb_arr, mode=mode)
 
     return Image.fromarray(binary, mode="L")
