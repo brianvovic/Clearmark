@@ -1,12 +1,8 @@
 """
-Peel / attenuate translucent watermarks on skin & clothing.
+Strong peel / attenuate for watermarks on skin & clothing + optional thin fill.
 
-Never uses LaMa or SDXL. Pipeline:
-  1) Restrict to thin stroke core
-  2) Estimate local background B and alpha a
-  3) Unblend: B ≈ (I - a·W) / (1-a) with W≈I (ink colour ≈ observed)
-  4) Re-inject high-frequency detail from the original (pores / fabric)
-  5) residual_strokes() — thin leftover ink after peel for an optional 2nd peel
+Peel keeps high-frequency texture. If ink still remains, ``thin_fill`` runs a
+small-radius Telea on the stroke core only (not a fat blob / not SDXL).
 """
 
 from __future__ import annotations
@@ -16,59 +12,80 @@ import numpy as np
 from PIL import Image
 
 
-def _stroke_core(mask: np.ndarray) -> np.ndarray:
+def _stroke_core(mask: np.ndarray, grow: int = 2) -> np.ndarray:
     m = (mask > 127).astype(np.uint8) * 255
     if m.max() == 0:
         return m
     core = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     if core.max() == 0:
         core = m
-    return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1)
+    if grow > 0:
+        k = grow * 2 + 1
+        core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), 1)
+    return core
 
 
-def peel_overlay(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Alpha-aware peel; outside mask is bit-exact original."""
-    core = _stroke_core(mask)
+def peel_overlay(rgb: np.ndarray, mask: np.ndarray, *, strength: float = 1.0) -> np.ndarray:
+    """
+    Aggressive alpha peel. ``strength`` 0.7–1.35 (smart/pro use ≥1.0).
+    Outside mask is bit-exact original.
+    """
+    core = _stroke_core(mask, grow=2)
     if core.max() == 0:
         return rgb
 
     orig = rgb.astype(np.float32)
-    # Local background via small Telea — used only as B estimate, never as final
-    B = cv2.inpaint(rgb, core, inpaintRadius=2, flags=cv2.INPAINT_TELEA).astype(np.float32)
+    B = cv2.inpaint(rgb, core, inpaintRadius=3, flags=cv2.INPAINT_TELEA).astype(np.float32)
 
-    # Alpha from colour distance to background (translucent ink lifts chroma/luma)
     delta = np.abs(orig - B).mean(axis=2, keepdims=True)
-    a = np.clip(delta / 32.0, 0.0, 0.85)
+    # Stronger alpha — previous /32 left gaigu almost untouched
+    a = np.clip(delta / 18.0, 0.15, 0.95) * float(strength)
+    a = np.clip(a, 0.0, 0.98)
     core3 = (core > 0).astype(np.float32)[..., None]
     a = a * core3
-    a = cv2.GaussianBlur(a, (0, 0), 0.6)
+    a = cv2.GaussianBlur(a, (0, 0), 0.5)
     if a.ndim == 2:
         a = a[..., None]
 
-    blur_o = cv2.GaussianBlur(orig, (0, 0), 1.4)
-    blur_b = cv2.GaussianBlur(B, (0, 0), 1.4)
+    blur_o = cv2.GaussianBlur(orig, (0, 0), 1.2)
+    blur_b = cv2.GaussianBlur(B, (0, 0), 1.2)
     detail = orig - blur_o
+    # Mix more toward clean low-freq; keep detail for pores/fabric
     low = blur_o * (1.0 - a) + blur_b * a
-    peeled = np.clip(low + detail, 0, 255)
+    peeled = np.clip(low + detail * (1.0 - 0.35 * a), 0, 255)
 
     w = (core > 0).astype(np.float32)
-    w = cv2.GaussianBlur(w, (0, 0), 0.5)
+    w = cv2.GaussianBlur(w, (0, 0), 0.45)
     if w.ndim == 2:
         w = w[..., None]
+    # Force almost full replace under core when strength high
+    w = np.clip(w * (0.55 + 0.45 * float(strength)), 0, 1)
     out = orig * (1.0 - w) + peeled * w
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def thin_fill(rgb: np.ndarray, mask: np.ndarray, *, radius: int = 3) -> np.ndarray:
+    """Last-resort Telea on stroke core only — still not SDXL/LaMa-tiler."""
+    core = _stroke_core(mask, grow=1)
+    if core.max() == 0:
+        return rgb
+    filled = cv2.inpaint(rgb, core, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
+    out = rgb.copy()
+    sel = core > 0
+    # Blend 70% fill / 30% original to avoid plastic smear
+    out[sel] = (
+        filled[sel].astype(np.float32) * 0.72 + rgb[sel].astype(np.float32) * 0.28
+    ).astype(np.uint8)
+    return out
+
+
 def residual_strokes(
     rgb_after: np.ndarray,
-    body: np.ndarray | None = None,
+    seed_mask: np.ndarray | None = None,
     *,
-    min_delta: float = 12.0,
+    min_delta: float = 8.0,
 ) -> np.ndarray:
-    """
-    Thin leftover watermark ink after peel — for a second peel pass only.
-    Uses neon/chroma residual; never returns fat blobs.
-    """
+    """Leftover ink near the original watermark region after peel."""
     try:
         from services.mask import neon_watermark_mask
 
@@ -76,21 +93,20 @@ def residual_strokes(
     except Exception:  # noqa: BLE001
         neon = np.zeros(rgb_after.shape[:2], np.uint8)
 
-    # Also catch pale white/pink text via local contrast
     gray = cv2.cvtColor(rgb_after, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    local = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    local = cv2.GaussianBlur(gray, (0, 0), 2.5)
     hi = (np.abs(gray - local) > min_delta).astype(np.uint8) * 255
     hi = cv2.morphologyEx(hi, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
     residual = cv2.bitwise_or(neon, hi)
-    if body is not None and body.max():
-        residual = cv2.bitwise_and(residual, (body > 0).astype(np.uint8) * 255)
-
-    # Keep only thin components
-    from services.body_region import thin_strokes_on_body
-
-    body_m = body if body is not None else np.full(residual.shape, 255, np.uint8)
-    return thin_strokes_on_body(residual, body_m, max_thick=8.0, max_body_cov=0.02)
+    if seed_mask is not None and seed_mask.max():
+        near = cv2.dilate(
+            (seed_mask > 127).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+            1,
+        )
+        residual = cv2.bitwise_and(residual, near)
+    return residual
 
 
 def peel_image(image: Image.Image, mask: Image.Image) -> Image.Image:

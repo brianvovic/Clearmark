@@ -216,6 +216,50 @@ async def detect_mask(
     return Response(content=_to_png_bytes(mask.convert("RGB")), media_type="image/png")
 
 
+@app.post("/api/debug-masks")
+async def debug_masks(
+    image: UploadFile = File(...),
+    remove_text: Optional[str] = Form(default="1"),
+    mode: Optional[str] = Form(default="smart"),
+):
+    """
+    Debug overlay: red = body peel zone, cyan = bg inpaint zone, yellow = body region.
+    Helps verify routing is not locking everything as 'body'.
+    """
+    import cv2
+    from services.body_region import body_mask, refine_body_mask, split_watermark_mask
+
+    raw = await _read_upload(image, "ảnh")
+    original = _load_image(raw)
+    rgb = np.asarray(original.convert("RGB"))
+    body = body_mask(rgb, dilate_px=10)
+    wm = engine.detect_mask(original, _truthy(remove_text), mode=mode or "smart")
+    m = refine_body_mask(np.asarray(wm.convert("L")), body)
+    on_body, on_bg = split_watermark_mask(m, body)
+    vis = rgb.copy()
+    vis[body > 0] = (
+        vis[body > 0].astype(np.float32) * 0.7 + np.array([40, 40, 0], np.float32)
+    ).astype(np.uint8)
+    vis[on_bg > 0] = [0, 220, 220]
+    vis[on_body > 0] = [220, 40, 40]
+    meta = {
+        "body_frac": round(float((body > 0).mean()), 4),
+        "wm_px": int((m > 0).sum()),
+        "on_body_px": int((on_body > 0).sum()),
+        "on_bg_px": int((on_bg > 0).sum()),
+    }
+    return Response(
+        content=_to_png_bytes(Image.fromarray(vis)),
+        media_type="image/png",
+        headers={
+            "X-ClearMark-Body-Frac": str(meta["body_frac"]),
+            "X-ClearMark-On-Body": str(meta["on_body_px"]),
+            "X-ClearMark-On-Bg": str(meta["on_bg_px"]),
+            "X-ClearMark-Wm": str(meta["wm_px"]),
+        },
+    )
+
+
 def _mask_from_upload(mask_raw: bytes, size: tuple[int, int]) -> np.ndarray:
     """Uploaded brush PNG → full-res binary mask (uint8 {0,255})."""
     import cv2

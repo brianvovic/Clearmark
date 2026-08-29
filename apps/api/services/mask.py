@@ -248,7 +248,39 @@ def protect_mask(rgb: np.ndarray) -> np.ndarray:
     return cv2.bitwise_or(keep, skin)
 
 
+def _apply_face_protection(mask: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    """Zero mask only on face/head boxes — keep strokes on body skin for peel."""
+    h, w = rgb.shape[:2]
+    face = np.zeros((h, w), np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    for c in _get_face_cascades():
+        try:
+            faces = c.detectMultiScale(
+                gray, scaleFactor=1.15, minNeighbors=5,
+                minSize=(max(24, w // 25), max(24, h // 25)),
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        for (x, y, fw, fh) in faces:
+            ex, ey = int(fw * 0.45), int(fh * 0.6)
+            cv2.rectangle(
+                face,
+                (max(0, x - ex), max(0, y - ey)),
+                (min(w, x + fw + ex), min(h, y + fh + ey)),
+                255, -1,
+            )
+    if face.max() == 0:
+        return mask
+    out = mask.copy()
+    out[face > 0] = 0
+    removed = int((mask > 0).sum() - (out > 0).sum())
+    if removed > 0:
+        logger.info("face protection removed %d masked px", removed)
+    return out
+
+
 def _apply_protection(mask: np.ndarray, rgb: np.ndarray) -> np.ndarray:
+    """Legacy full face+skin strip — prefer ``_apply_face_protection`` for OCR/text."""
     keep = protect_mask(rgb)
     protected = cv2.bitwise_and(mask, cv2.bitwise_not(keep))
     removed = int((mask > 0).sum() - (protected > 0).sum())
@@ -348,12 +380,13 @@ def build_auto_mask(image: Image.Image, remove_text: bool = True) -> Image.Image
     logo = _colored_logo_mask(rgb)
     mask = cv2.bitwise_or(mask, logo)
 
-    # Safety net: never let auto-removal touch faces / skin (manual brush bypasses).
-    mask = _apply_protection(mask, rgb)
+    # Face only — skin/body text must stay so erase can peel it.
+    # (Full skin wipe here was why "gaigu" on body never reached removal.)
+    mask = _apply_face_protection(mask, rgb)
 
     # Hard cap — prevents whole-image smear
     cov = float((mask > 0).mean())
-    if cov > 0.08:
+    if cov > 0.12:
         # keep largest few components only
         num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         parts = sorted(
@@ -361,7 +394,7 @@ def build_auto_mask(image: Image.Image, remove_text: bool = True) -> Image.Image
             reverse=True,
         )
         out = np.zeros_like(mask)
-        budget = int(0.08 * h * w)
+        budget = int(0.12 * h * w)
         used = 0
         for area, i in parts:
             if used + area > budget:

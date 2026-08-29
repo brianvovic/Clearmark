@@ -93,10 +93,10 @@ def apply_subject_guard(
     if face.max():
         out[face > 0] = 0
 
-    # --- Soft body-skin: shrink halo ---
+    # Soft body-skin: shrink dilate halo only (1 iter) — never wipe text cores
     keep = protect_mask(rgb)
     skin = keep.copy()
-    skin[face > 0] = 0  # face already handled
+    skin[face > 0] = 0
     if skin.max() == 0 or out.max() == 0:
         return out
 
@@ -104,11 +104,12 @@ def apply_subject_guard(
     if not on_skin.any():
         return out
 
-    # Erode mask 1–2 iterations so dilate fringe on skin/clothes is pulled back
-    iters = 2 if mode in ("pro", "smart", "4.0") else 1
+    iters = 1  # was 2 — erased thin "gaigu" strokes on chest
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     eroded = cv2.erode(out, k, iterations=iters)
-    # Outside skin: keep dilated mask; on skin: only eroded core
+    # If erode wiped the on-skin core, keep original on-skin pixels
+    if not ((eroded > 0) & (skin > 0)).any() and on_skin.any():
+        return out
     out = np.where(skin > 0, eroded, out).astype(np.uint8)
     _, out = cv2.threshold(out, 127, 255, cv2.THRESH_BINARY)
     return out
