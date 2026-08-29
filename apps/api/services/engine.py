@@ -227,8 +227,14 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
     """
     from services.mask_prep import prepare_removal_mask
 
-    # CRITICAL: binary 0/255 + edge-aware dilate so fill bites into clean background
-    mask = prepare_removal_mask(mask, size=original.size, mode=mode)
+    # Binary + small dilate + subject guard (face hard-block, skin halo shrink)
+    mask = prepare_removal_mask(
+        mask, size=original.size, mode=mode, rgb=original,
+    )
+    if np.array(mask).max() < 128:
+        # Guard ate the whole mask (e.g. watermark only on face) — refuse rather
+        # than smear the subject; caller/manual can still brush.
+        return original.convert("RGB")
 
     if worker_url():
         try:
@@ -244,7 +250,7 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU erase failed, falling back to local: %s", exc)
 
-    # PRO: Flux (if FLUX_ENABLE=1) → else SDXL → else LaMa
+    # PRO: Flux → SDXL → LaMa (still subject-guarded mask)
     if mode == "pro":
         try:
             from services import flux
@@ -276,16 +282,16 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
         except Exception as exc:  # noqa: BLE001
             logger.warning("removal model failed, using LaMa: %s", exc)
 
-    # Default LaMa tiling
+    # Default / smart: LaMa tiling first (safe on body)
     result = inpaint_fullres(original, mask)
 
-    # Hard-case escalate: large mask or strong residual ghost → SDXL if available
-    if mode == "smart" and _is_hard_case(original, result, mask):
+    # Smart escalate to SDXL ONLY when LaMa left a ghost AND mask is not mostly on person
+    if mode == "smart" and _should_escalate_sdxl(original, result, mask):
         try:
             from services import sdxl
 
             if sdxl.available():
-                logger.info("hard case → escalating to SDXL inpaint")
+                logger.info("residual ghost (low skin overlap) → SDXL")
                 result = sdxl.inpaint(original, mask)
         except Exception as exc:  # noqa: BLE001
             logger.warning("SDXL escalate skipped: %s", exc)
@@ -293,19 +299,33 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
     return _maybe_sharpen(result, mask)
 
 
-def _is_hard_case(original: Image.Image, filled: Image.Image, mask: Image.Image) -> bool:
-    """Large hole or still-ghosty residual after LaMa → worth a diffusion pass."""
+def _mask_skin_overlap(mask: Image.Image, original: Image.Image) -> float:
+    """Fraction of masked pixels that fall on face/skin protect zones."""
+    from services.mask import protect_mask
+
     m = np.asarray(mask.convert("L")) > 127
-    cov = float(m.mean()) if m.size else 0.0
-    if cov >= 0.08:  # big logo / banner
-        return True
+    if not m.any():
+        return 0.0
+    keep = protect_mask(np.asarray(original.convert("RGB")))
+    return float((keep[m] > 0).mean())
+
+
+def _should_escalate_sdxl(
+    original: Image.Image, filled: Image.Image, mask: Image.Image
+) -> bool:
+    """Escalate only if LaMa failed to change the hole AND hole is not on a person."""
+    skin_ov = _mask_skin_overlap(mask, original)
+    if skin_ov > 0.22:
+        # Watermark sits on body — SDXL tends to invent/erase clothing; stay LaMa
+        return False
+    m = np.asarray(mask.convert("L")) > 127
     if not m.any():
         return False
     o = np.asarray(original.convert("RGB"), dtype=np.float32)
     f = np.asarray(filled.convert("RGB"), dtype=np.float32)
-    # High-frequency leftover: filled still looks like original in mask (failed wipe)
     residual = float(np.abs(f[m] - o[m]).mean())
-    return residual < 8.0  # almost unchanged under mask → LaMa barely touched it
+    # LaMa barely changed pixels → still looks watermarked
+    return residual < 10.0
 
 
 def _maybe_sharpen(img: Image.Image, mask: Image.Image) -> Image.Image:
@@ -382,8 +402,8 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
     if mode == "fast":
         return out
 
-    # Safe (fast) = 1 pass; smart = 3; pro/aggressive = 4
-    default_passes = {"smart": 3, "pro": 4}.get(mode, 3)
+    # Fewer passes — extra rounds compound bad masks into body smear
+    default_passes = {"smart": 2, "pro": 2}.get(mode, 2)
     max_passes = max(1, int(os.getenv("ERASE_PASSES", str(default_passes))))
     for p in range(1, max_passes):
         leftover = detect_mask(out, remove_text, mode=mode)
@@ -391,17 +411,18 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
         if arr.max() < 128:
             break
         cov = float((arr > 127).mean())
-        # Ignore tiny noise speckles and absurd full-frame false positives
-        if cov < 5e-5 or cov > _MAX_MASK_COVERAGE:
+        if cov < 1e-4 or cov > _MAX_MASK_COVERAGE:
             break
-        if mode != "fast":
-            try:
-                from services import sam_refine
+        # Subject-guard leftover; skip pass if guard clears it or it's mostly skin noise
+        from services.mask_prep import prepare_removal_mask
 
-                if sam_refine.available():
-                    leftover = sam_refine.refine(out, leftover)
-            except Exception:  # noqa: BLE001
-                pass
+        leftover = prepare_removal_mask(leftover, size=out.size, mode=mode, rgb=out)
+        larr = np.asarray(leftover.convert("L"))
+        if larr.max() < 128:
+            break
+        if _mask_skin_overlap(leftover, out) > 0.35 and cov < 0.02:
+            # Tiny leftover on skin — don't risk another body-smear pass
+            break
         logger.info("erase multi-pass %d/%d — leftover coverage %.3f%%",
                     p + 1, max_passes, cov * 100)
         out = erase(out, leftover, mode=mode)

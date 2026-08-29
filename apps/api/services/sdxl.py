@@ -95,9 +95,9 @@ def inpaint(
     mask: Image.Image,
     prompt: str | None = None,
     negative_prompt: str | None = None,
-    strength: float = 0.85,
-    steps: int = 22,
-    guidance_scale: float = 7.0,
+    strength: float = 0.68,
+    steps: int = 20,
+    guidance_scale: float = 6.5,
 ) -> Image.Image:
     """Diffusion-inpaint the masked region; outside the mask stays original."""
     pipe = _load()
@@ -115,14 +115,15 @@ def inpaint(
         return image.convert("RGB")
 
     x0, y0, x1, y1 = bbox
-    pad = int(0.35 * max(x1 - x0, y1 - y0)) + 16
+    pad = int(0.25 * max(x1 - x0, y1 - y0)) + 12
     x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
     x1, y1 = min(W, x1 + pad), min(H, y1 + pad)
     crop = Image.fromarray(rgb[y0:y1, x0:x1])
+    # Tiny fringe only — large dilate here was eating limbs/clothes
     cmask = Image.fromarray(
         cv2.dilate(
             mbin[y0:y1, x0:x1],
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
             1,
         )
     )
@@ -131,9 +132,15 @@ def inpaint(
 
     gen = pipe(
         prompt=prompt
-        or "high quality photograph, detailed texture, sharp focus, natural lighting, seamless",
+        or (
+            "high quality photo, keep the person clothing skin and body completely intact, "
+            "only remove watermark text and logo, natural seamless texture"
+        ),
         negative_prompt=negative_prompt
-        or "blurry, low quality, watermark, text, logo, signature, deformed, artifacts",
+        or (
+            "blurry, deformed body, missing clothes, transparent skin, erased limbs, "
+            "watermark, text, logo, signature, artifacts"
+        ),
         image=crop.resize((work, work), Image.Resampling.LANCZOS),
         mask_image=cmask.resize((work, work), Image.Resampling.NEAREST),
         num_inference_steps=steps,

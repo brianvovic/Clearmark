@@ -989,9 +989,9 @@ export default function HomePage() {
                 {mode === "auto" && (
                   <div className="flex flex-wrap gap-2">
                     {([
-                      { id: "fast", label: "An toàn", hint: "Ít đụng mặt/da · 1 vòng · LaMa" },
-                      { id: "smart", label: "Thông minh", hint: "Union detect · multi-pass · hard→SDXL" },
-                      { id: "pro", label: "Mạnh", hint: "Aggressive · SDXL + nhiều vòng (nếu bật)" },
+                      { id: "fast", label: "An toàn", hint: "LaMa · dilate nhỏ · bảo vệ da/mặt" },
+                      { id: "smart", label: "Thông minh", hint: "LaMa trước · SDXL chỉ khi sót (không đè người)" },
+                      { id: "pro", label: "Mạnh", hint: "SDXL/Flux · dilate chặt · bảo vệ subject" },
                     ] as const).map((m) => (
                       <button
                         key={m.id}
