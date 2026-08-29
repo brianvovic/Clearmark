@@ -193,7 +193,8 @@ async def manual_inpaint(
         )
 
     try:
-        result = engine.erase(original, mask_img)
+        # A brushed mask is the user's explicit intent — remove exactly that.
+        result = engine.erase(original, mask_img, trusted=mask_img)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -223,39 +224,32 @@ async def debug_masks(
     mode: Optional[str] = Form(default="smart"),
 ):
     """
-    Debug overlay: red = body peel zone, cyan = bg inpaint zone, yellow = body region.
-    Helps verify routing is not locking everything as 'body'.
+    Debug overlay of the removal routing:
+      red = thin ink (peel), green = small solid (inpaint), blue = wide (de-tint only).
     """
     import cv2
-    from services.body_region import body_mask, refine_body_mask, split_watermark_mask
+    from services.ink import classify
 
     raw = await _read_upload(image, "ảnh")
     original = _load_image(raw)
     rgb = np.asarray(original.convert("RGB"))
-    body = body_mask(rgb, dilate_px=10)
     wm = engine.detect_mask(original, _truthy(remove_text), mode=mode or "smart")
-    m = refine_body_mask(np.asarray(wm.convert("L")), body)
-    on_body, on_bg = split_watermark_mask(m, body)
+    m = np.asarray(wm.convert("L"))
+    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+    thin, solid, wide = classify(rgb, m)
+
     vis = rgb.copy()
-    vis[body > 0] = (
-        vis[body > 0].astype(np.float32) * 0.7 + np.array([40, 40, 0], np.float32)
-    ).astype(np.uint8)
-    vis[on_bg > 0] = [0, 220, 220]
-    vis[on_body > 0] = [220, 40, 40]
-    meta = {
-        "body_frac": round(float((body > 0).mean()), 4),
-        "wm_px": int((m > 0).sum()),
-        "on_body_px": int((on_body > 0).sum()),
-        "on_bg_px": int((on_bg > 0).sum()),
-    }
+    vis[wide > 0] = [40, 80, 230]
+    vis[solid > 0] = [40, 200, 60]
+    vis[thin > 0] = [230, 40, 40]
     return Response(
         content=_to_png_bytes(Image.fromarray(vis)),
         media_type="image/png",
         headers={
-            "X-ClearMark-Body-Frac": str(meta["body_frac"]),
-            "X-ClearMark-On-Body": str(meta["on_body_px"]),
-            "X-ClearMark-On-Bg": str(meta["on_bg_px"]),
-            "X-ClearMark-Wm": str(meta["wm_px"]),
+            "X-ClearMark-Mask": str(int((m > 0).sum())),
+            "X-ClearMark-Thin": str(int((thin > 0).sum())),
+            "X-ClearMark-Solid": str(int((solid > 0).sum())),
+            "X-ClearMark-Wide": str(int((wide > 0).sum())),
         },
     )
 
@@ -304,6 +298,7 @@ async def session_erase(
         raise HTTPException(status_code=404, detail="Phiên đã hết hạn — hãy tải lại ảnh.") from exc
 
     added = False
+    brushed: np.ndarray | None = None
     if mode is None or mode == "auto":
         auto = engine.detect_mask(original, _truthy(remove_text))
         if np.array(auto).max() >= 128:
@@ -311,7 +306,8 @@ async def session_erase(
             added = True
     if mask is not None and mask.filename:
         mask_raw = await _read_upload(mask, "mask")
-        sessions.accumulate(sid, _mask_from_upload(mask_raw, original.size))
+        brushed = _mask_from_upload(mask_raw, original.size)
+        sessions.accumulate(sid, brushed)
         added = True
 
     acc = sessions.get_mask(sid)
@@ -324,7 +320,11 @@ async def session_erase(
         raise HTTPException(status_code=422, detail=detail)
 
     try:
-        result = engine.erase(original, Image.fromarray(acc, mode="L"))
+        result = engine.erase(
+            original,
+            Image.fromarray(acc, mode="L"),
+            trusted=Image.fromarray(brushed, mode="L") if brushed is not None else None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

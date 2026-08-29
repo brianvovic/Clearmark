@@ -989,9 +989,9 @@ export default function HomePage() {
                 {mode === "auto" && (
                   <div className="flex flex-wrap gap-2">
                     {([
-                      { id: "fast", label: "An toàn", hint: "Body: peel mạnh · Nền: LaMa" },
-                      { id: "smart", label: "Thông minh", hint: "Body: peel+fill · Nền: LaMa→SDXL" },
-                      { id: "pro", label: "Mạnh", hint: "Body: peel chặt+fill · Nền: SDXL/Flux" },
+                      { id: "fast", label: "An toàn", hint: "Chỉ xóa nét mực, giữ nguyên ảnh" },
+                      { id: "smart", label: "Thông minh", hint: "Nét mực + LaMa cho vùng có vân" },
+                      { id: "pro", label: "Mạnh", hint: "Thêm SDXL/Flux cho logo đặc" },
                     ] as const).map((m) => (
                       <button
                         key={m.id}

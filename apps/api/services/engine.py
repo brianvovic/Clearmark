@@ -139,7 +139,23 @@ def _thin_components(mask: np.ndarray, *, max_thick: float = 14.0) -> np.ndarray
 
 
 def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
-    """Detect watermark mask. BG components kept fully; body refined to strokes."""
+    """Union of every detector — for previews and for the session mask."""
+    trusted, guess = detect_split(original, remove_text, mode=mode)
+    united = _union_masks(original.size, trusted, guess)
+    return united if united is not None else Image.new("L", original.size, 0)
+
+
+def detect_split(
+    original: Image.Image, remove_text: bool, mode: str = "smart"
+) -> tuple[Image.Image, Image.Image]:
+    """
+    Detect watermarks, keeping stroke-accurate hits apart from blobby guesses.
+
+    Merging them was why nothing got removed: the colour detector's thin "gaigu"
+    strokes were absorbed into a Florence box covering a fifth of the frame, and
+    the whole component was then rejected as too coarse to touch.
+    """
+    empty = Image.new("L", original.size, 0)
     if worker_url():
         try:
             png = _post(
@@ -150,18 +166,14 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
             m = Image.open(io.BytesIO(png)).convert("L")
             if m.size != original.size:
                 m = m.resize(original.size, Image.Resampling.NEAREST)
-            return m
+            return empty, m
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU detect failed, falling back to local: %s", exc)
 
-    from services.body_region import body_mask, refine_body_mask
-
     size = original.size
     rgb = np.array(original.convert("RGB"))
-    body = body_mask(rgb, dilate_px=10)
-    person = float((body > 0).mean()) > 0.05
-    parts: list[Image.Image] = []
-    fallback: Image.Image | None = None
+    exact: list[Image.Image] = []
+    rough: list[Image.Image] = []
 
     def _accept(mask_img: Image.Image | np.ndarray, *, max_cov: float = 0.35) -> Image.Image | None:
         if isinstance(mask_img, np.ndarray):
@@ -170,45 +182,27 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
             arr = np.asarray(mask_img.convert("L"))
         if not _mask_ok(arr, max_cov=max_cov):
             return None
-        # Always refine: keep BG intact, trim absurd body blobs only
-        refined = refine_body_mask(arr, body)
-        if refined.max() == 0:
-            return None
-        return Image.fromarray(refined, mode="L")
+        return Image.fromarray(arr, mode="L")
 
-    try:
-        from services import wm_detector
+    def _file(mask: Image.Image, trust_cov: float) -> None:
+        """Trust a stroke-accurate source only while it stays plausible: a colour
+        rule that lights up a fifth of the frame is describing the photo."""
+        cov = float((np.asarray(mask) > 127).mean())
+        if cov <= trust_cov:
+            exact.append(mask)
+        else:
+            logger.info("source demoted to guess: coverage %.1f%%", cov * 100)
+            rough.append(mask)
 
-        if mode != "fast" and wm_detector.available():
-            ok = _accept(wm_detector.detect(original), max_cov=0.35)
-            if ok is not None:
-                parts.append(ok)
-                fallback = fallback or ok
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("trained detector failed: %s", exc)
-
+    # --- stroke-accurate sources ---
     try:
         from services.mask import neon_watermark_mask
 
-        neon = neon_watermark_mask(rgb)
-        ok = _accept(neon, max_cov=0.3)
+        ok = _accept(neon_watermark_mask(rgb), max_cov=0.3)
         if ok is not None:
-            parts.append(ok)
-            fallback = fallback or ok
+            _file(ok, 0.06)
     except Exception as exc:  # noqa: BLE001
         logger.warning("neon detect failed: %s", exc)
-
-    try:
-        from services import florence
-
-        if mode != "fast" and florence.available():
-            # Florence OK on non-person; on person still useful for big logos off-body
-            ok = _accept(florence.detect(original, remove_text), max_cov=0.35)
-            if ok is not None:
-                parts.append(ok)
-                fallback = fallback or ok
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Florence detect failed: %s", exc)
 
     try:
         small = _maybe_downscale(original, 2048)
@@ -217,21 +211,39 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
             mask = mask.resize(size, Image.Resampling.NEAREST)
         ok = _accept(mask, max_cov=0.35)
         if ok is not None:
-            parts.append(ok)
-            fallback = fallback or ok
+            _file(ok, 0.08)
     except Exception as exc:  # noqa: BLE001
         logger.warning("heuristic detect failed: %s", exc)
 
-    united = _union_masks(size, *parts)
-    if united is not None:
-        return Image.fromarray(refine_body_mask(np.asarray(united), body), mode="L")
-    if fallback is not None:
-        return fallback
-    # Union too large — keep best single part rather than empty (empty = zero removal)
-    if parts:
-        best = max(parts, key=lambda m: int((np.asarray(m.convert("L")) > 127).sum()))
-        return Image.fromarray(refine_body_mask(np.asarray(best), body), mode="L")
-    return Image.new("L", size, 0)
+    # --- blobby sources (must prove ink before anything is filled) ---
+    try:
+        from services import wm_detector
+
+        if mode != "fast" and wm_detector.available():
+            ok = _accept(wm_detector.detect(original), max_cov=0.35)
+            if ok is not None:
+                rough.append(ok)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("trained detector failed: %s", exc)
+
+    try:
+        from services import florence
+
+        if mode != "fast" and florence.available():
+            ok = _accept(florence.detect(original, remove_text), max_cov=0.35)
+            if ok is not None:
+                rough.append(ok)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Florence detect failed: %s", exc)
+
+    trusted = _union_masks(size, *exact) or empty
+    guess = _union_masks(size, *rough) or empty
+    logger.info(
+        "detect: trusted=%.2f%% guess=%.2f%%",
+        100.0 * float(np.asarray(trusted).mean() / 255.0),
+        100.0 * float(np.asarray(guess).mean() / 255.0),
+    )
+    return trusted, guess
 
 
 def erase(
@@ -240,107 +252,113 @@ def erase(
     mode: str = "smart",
     *,
     remove_text: bool = False,
+    trusted: Image.Image | None = None,
 ) -> Image.Image:
     """
-    Balanced removal:
-      body → strong peel (+ thin Telea if residual / text mode)
-      bg   → full LaMa (SDXL/Flux on smart escalate / pro)
+    Removal routed by what the masked pixels actually are:
+
+      thin ink   → alpha peel + tiny Telea   (works on skin, clothes, anything)
+      small solid→ LaMa / SDXL(pro)          (opaque stamp, capped by size)
+      wide area  → tint correction only      (never generative → never smears)
+
+    A wrong mask can therefore dim a region, but can never repaint a person.
     """
-    from services.attenuate import peel_overlay, residual_strokes, thin_fill
-    from services.body_region import body_mask, refine_body_mask, split_watermark_mask
+    from services.attenuate import erase_ink, smooth_fill
+    from services.ink import (
+        classify,
+        correct_tint,
+        ink_within,
+        promote_matching_ink,
+        split_by_surround_texture,
+    )
+    from services.mask import _apply_face_protection
     from services.mask_prep import prepare_removal_mask
 
     rgb = np.asarray(original.convert("RGB"))
-    body = body_mask(rgb, dilate_px=10)
 
-    # Binary + small dilate — do NOT subject-guard away text on skin
     mask = prepare_removal_mask(mask, size=original.size, mode=mode, rgb=None)
-    m = refine_body_mask(np.asarray(mask.convert("L")), body)
-    if m.max() < 128:
-        m = np.asarray(mask.convert("L"))
-        _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+    m = np.asarray(mask.convert("L"))
+    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
+    m = _apply_face_protection(m, rgb)
     if m.max() < 128:
         return original.convert("RGB")
 
-    on_body, on_bg = split_watermark_mask(m, body)
-    # If body zone swallowed the whole frame (skin-tone bg), treat thick blobs as bg
-    body_frac = float((body > 0).mean())
-    if body_frac > 0.55 and on_bg.max() == 0 and on_body.max():
-        # Reclassify fat components as background so LaMa can run
-        n, labels, stats, _ = cv2.connectedComponentsWithStats(
-            (on_body > 0).astype(np.uint8), connectivity=8
-        )
-        body_area = max(1, int((body > 0).sum()))
-        new_body = np.zeros_like(on_body)
-        new_bg = np.zeros_like(on_body)
-        for i in range(1, n):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            comp = labels == i
-            dist = cv2.distanceTransform(comp.astype(np.uint8), cv2.DIST_L2, 3)
-            thick = float(dist.max() * 2) if dist.size else 0.0
-            # Fat logo / stamp → bg inpaint; thin text stays body peel
-            if thick > 22 or area / body_area > 0.04:
-                new_bg[comp] = 255
-            else:
-                new_body[comp] = 255
-        if new_bg.max():
-            on_body, on_bg = new_body, new_bg
-            logger.info(
-                "body-zone reclass: peel=%d inpaint=%d (body_frac=%.2f)",
-                int((on_body > 0).sum()),
-                int((on_bg > 0).sum()),
-                body_frac,
-            )
+    # Stroke-accurate masks (brush, colour detector, OCR) are removed as drawn;
+    # everything else has to show ink first.
+    if trusted is not None:
+        t = np.asarray(trusted.convert("L"))
+        if t.shape != m.shape:
+            t = cv2.resize(t, (m.shape[1], m.shape[0]), interpolation=cv2.INTER_NEAREST)
+        _, t = cv2.threshold(t, 127, 255, cv2.THRESH_BINARY)
+        t = _apply_face_protection(t, rgb)
+        t = cv2.bitwise_and(t, m)
+    else:
+        t = np.zeros_like(m)
 
+    guess = cv2.bitwise_and(m, cv2.bitwise_not(t))
+    if t.max() and guess.max():
+        # Let a confirmed mark claim the halo a coarse box adds around it, but
+        # no further: a box drawn around the watermark often also covers a bird
+        # or a face, and those must not inherit the confirmation.
+        halo = cv2.dilate(t, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)), 1)
+        t = cv2.bitwise_or(t, cv2.bitwise_and(guess, halo))
+        guess = cv2.bitwise_and(m, cv2.bitwise_not(t))
+        # Same ink elsewhere in the box = same watermark
+        t = cv2.bitwise_or(t, promote_matching_ink(rgb, t, guess))
+        guess = cv2.bitwise_and(m, cv2.bitwise_not(t))
+
+    thin, solid, wide = classify(rgb, guess)
+    if t.max():
+        t_thin, t_solid, t_wide = classify(rgb, t, trusted=True)
+        thin = cv2.bitwise_or(thin, t_thin)
+        solid = cv2.bitwise_or(solid, t_solid)
+        wide = cv2.bitwise_or(wide, t_wide)
     out = rgb.copy()
-    peel_strength = {"fast": 1.05, "smart": 1.25, "pro": 1.35}.get(mode, 1.2)
-    if remove_text:
-        peel_strength = min(1.45, peel_strength + 0.15)
 
-    # ----- BODY -----
-    if on_body.max():
-        out = peel_overlay(out, on_body, strength=peel_strength)
+    # 1) Translucent panels / bands — flatten the tint, keep every detail
+    if wide.max():
+        out = correct_tint(out, wide)
+
+    # 2) Ink — fill the strokes themselves, then re-measure what is still painted on
+    if thin.max():
+        radius = 2 if mode == "fast" else 3
+        area0 = max(1, int((thin > 0).sum()))
+        out = erase_ink(out, thin, radius=radius)
+
         rounds = 1 if mode == "fast" else (2 if mode == "smart" else 3)
-        if remove_text:
-            rounds += 1
-        seed = on_body
         for _ in range(rounds):
-            resid = residual_strokes(out, seed_mask=seed, min_delta=7.0)
-            if resid.max() == 0:
+            # Ink is re-detected against the local texture level, so this loop
+            # stops as soon as only photo detail is left (no runaway blurring).
+            resid = ink_within(out, thin, min_delta=9.0)
+            left = int((resid > 0).sum())
+            if left == 0 or left < 0.02 * area0:
                 break
-            out = peel_overlay(out, resid, strength=peel_strength)
-            seed = resid
-        # Thin Telea when residual remains (always if remove_text)
-        if mode in ("smart", "pro") or remove_text:
-            resid = residual_strokes(out, seed_mask=on_body, min_delta=6.0)
-            if resid.max():
-                logger.info("body thin_fill %d px", int((resid > 0).sum()))
-                out = thin_fill(
-                    out, resid, radius=2 if mode == "smart" and not remove_text else 3
-                )
-        logger.info("body peel done (%d px)", int((on_body > 0).sum()))
+            # Opaque leftovers carry no recoverable texture — fill those strokes
+            out = erase_ink(out, resid, radius=radius)
+        logger.info("ink handled (%d px)", area0)
 
-    # ----- BACKGROUND -----
-    if on_bg.max():
-        bg_img = Image.fromarray(out)
-        bg_m = Image.fromarray(on_bg, mode="L")
-        logger.info("bg inpaint %d px mode=%s", int((on_bg > 0).sum()), mode)
-
-        def _telea_fallback(img: Image.Image, msk: Image.Image) -> np.ndarray:
-            arr = np.asarray(img.convert("RGB"))
-            mb = np.asarray(msk.convert("L"))
-            _, mb = cv2.threshold(mb, 127, 255, cv2.THRESH_BINARY)
-            return thin_fill(arr, mb, radius=5)
-
-        filled_arr: np.ndarray | None = None
+    # 3) Compact blobs — the only path allowed to invent pixels
+    if solid.max():
+        # On a smooth backdrop a generative fill leaves a visible patch, while
+        # interpolation is invisible; keep the heavy model for real texture.
+        flat, textured = split_by_surround_texture(out, solid)
+        if flat.max():
+            logger.info("smooth fill %d px", int((flat > 0).sum()))
+            out = smooth_fill(out, flat)
+        solid = textured
+    if solid.max():
+        src = Image.fromarray(out)
+        sm = Image.fromarray(solid, mode="L")
+        logger.info("solid inpaint %d px mode=%s", int((solid > 0).sum()), mode)
+        filled: np.ndarray | None = None
 
         if worker_url():
             try:
                 png = _post(
                     "/erase",
                     files={
-                        "image": ("image.png", _png(bg_img), "image/png"),
-                        "mask": ("mask.png", _png(bg_m), "image/png"),
+                        "image": ("image.png", _png(src), "image/png"),
+                        "mask": ("mask.png", _png(sm), "image/png"),
                     },
                     data={
                         "predict_mode": "4.0"
@@ -348,81 +366,33 @@ def erase(
                         else os.getenv("GPU_PREDICT_MODE", "3.0")
                     },
                 )
-                filled_arr = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
+                filled = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("GPU erase failed: %s", exc)
 
-        if filled_arr is None and mode == "pro":
+        if filled is None and mode == "pro":
             for modname in ("flux", "sdxl"):
                 try:
                     mod = __import__(
                         f"services.{modname}", fromlist=["available", "inpaint"]
                     )
                     if mod.available():
-                        filled_arr = np.asarray(
-                            mod.inpaint(bg_img, bg_m).convert("RGB")
-                        )
+                        filled = np.asarray(mod.inpaint(src, sm).convert("RGB"))
                         break
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("%s bg failed: %s", modname, exc)
+                    logger.warning("%s inpaint failed: %s", modname, exc)
 
-        if filled_arr is None:
+        if filled is None:
             try:
-                filled_arr = np.asarray(
-                    inpaint_fullres(bg_img, bg_m).convert("RGB")
-                )
+                filled = np.asarray(inpaint_fullres(src, sm).convert("RGB"))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LaMa/tiler failed, Telea fallback: %s", exc)
-                filled_arr = _telea_fallback(bg_img, bg_m)
+                filled = erase_ink(out, solid, radius=5)
 
-        out[on_bg > 0] = filled_arr[on_bg > 0]
-
-        if mode == "smart":
-            try:
-                from services import sdxl
-
-                before = bg_img
-                after = Image.fromarray(out)
-                if sdxl.available() and _should_escalate_sdxl(before, after, bg_m):
-                    filled_arr = np.asarray(sdxl.inpaint(bg_img, bg_m).convert("RGB"))
-                    out[on_bg > 0] = filled_arr[on_bg > 0]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("SDXL bg escalate skipped: %s", exc)
-
-    if not on_body.max() and not on_bg.max() and m.max():
-        logger.warning("split empty — fallback Telea")
-        out = thin_fill(out, m, radius=4)
+        sel = solid > 0
+        out[sel] = filled[sel]
 
     return Image.fromarray(out)
-
-
-def _mask_skin_overlap(mask: Image.Image, original: Image.Image) -> float:
-    """Fraction of masked pixels that fall on face/skin protect zones."""
-    from services.mask import protect_mask
-
-    m = np.asarray(mask.convert("L")) > 127
-    if not m.any():
-        return 0.0
-    keep = protect_mask(np.asarray(original.convert("RGB")))
-    return float((keep[m] > 0).mean())
-
-
-def _should_escalate_sdxl(
-    original: Image.Image, filled: Image.Image, mask: Image.Image
-) -> bool:
-    """Escalate only if LaMa failed to change the hole AND hole is not on a person."""
-    skin_ov = _mask_skin_overlap(mask, original)
-    if skin_ov > 0.22:
-        # Watermark sits on body — SDXL tends to invent/erase clothing; stay LaMa
-        return False
-    m = np.asarray(mask.convert("L")) > 127
-    if not m.any():
-        return False
-    o = np.asarray(original.convert("RGB"), dtype=np.float32)
-    f = np.asarray(filled.convert("RGB"), dtype=np.float32)
-    residual = float(np.abs(f[m] - o[m]).mean())
-    # LaMa barely changed pixels → still looks watermarked
-    return residual < 10.0
 
 
 def _maybe_sharpen(img: Image.Image, mask: Image.Image) -> Image.Image:
@@ -479,8 +449,9 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
     Handles images with many watermarks where pass-1 only clears some of them.
     Caps passes via ``ERASE_PASSES`` (default 3). Fast mode = single pass.
     """
-    mask = detect_mask(original, remove_text, mode=mode)
-    if np.array(mask).max() < 128:
+    trusted, guess = detect_split(original, remove_text, mode=mode)
+    mask = _union_masks(original.size, trusted, guess)
+    if mask is None or np.array(mask).max() < 128:
         hint = "chữ/logo mờ" if remove_text else "logo/watermark màu"
         raise ValueError(
             f"Không phát hiện {hint} rõ. Chuyển tab Thủ công, tô đúng vùng cần xóa rồi bấm Xử lý."
@@ -495,7 +466,7 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
         except Exception as exc:  # noqa: BLE001
             logger.warning("SAM refine skipped: %s", exc)
 
-    out = erase(original, mask, mode=mode, remove_text=remove_text)
+    out = erase(original, mask, mode=mode, remove_text=remove_text, trusted=trusted)
     if mode == "fast":
         return out
 
@@ -503,26 +474,13 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
     default_passes = {"smart": 2, "pro": 2}.get(mode, 2)
     max_passes = max(1, int(os.getenv("ERASE_PASSES", str(default_passes))))
     for p in range(1, max_passes):
-        leftover = detect_mask(out, remove_text, mode=mode)
+        left_trusted, left_guess = detect_split(out, remove_text, mode=mode)
+        leftover = _union_masks(out.size, left_trusted, left_guess)
+        if leftover is None:
+            break
         arr = np.asarray(leftover.convert("L"))
-        if arr.max() < 128:
-            break
         cov = float((arr > 127).mean())
-        if cov < 1e-4 or cov > _MAX_MASK_COVERAGE:
-            break
-        # Prep without subject-guard — leftover text on skin must stay
-        from services.mask_prep import prepare_removal_mask
-
-        leftover = prepare_removal_mask(leftover, size=out.size, mode=mode, rgb=None)
-        larr = np.asarray(leftover.convert("L"))
-        if larr.max() < 128:
-            break
-        # Skip only tiny non-text skin noise; keep going when remove_text
-        if (
-            not remove_text
-            and _mask_skin_overlap(leftover, out) > 0.35
-            and cov < 0.02
-        ):
+        if arr.max() < 128 or cov < 1e-4 or cov > _MAX_MASK_COVERAGE:
             break
         logger.info(
             "erase multi-pass %d/%d — leftover coverage %.3f%%",
@@ -530,7 +488,9 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
             max_passes,
             cov * 100,
         )
-        out = erase(out, leftover, mode=mode, remove_text=remove_text)
+        out = erase(
+            out, leftover, mode=mode, remove_text=remove_text, trusted=left_trusted
+        )
     return out
 
 

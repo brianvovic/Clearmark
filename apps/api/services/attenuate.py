@@ -64,19 +64,58 @@ def peel_overlay(rgb: np.ndarray, mask: np.ndarray, *, strength: float = 1.0) ->
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def thin_fill(rgb: np.ndarray, mask: np.ndarray, *, radius: int = 3) -> np.ndarray:
-    """Last-resort Telea on stroke core only — still not SDXL/LaMa-tiler."""
-    core = _stroke_core(mask, grow=1)
+def erase_ink(rgb: np.ndarray, mask: np.ndarray, *, radius: int = 3) -> np.ndarray:
+    """
+    Structure-aware fill of the ink pixels themselves.
+
+    Only the (1px grown) strokes are replaced, with a sub-pixel feather at the
+    edge. Nothing outside is blurred, so a stroke disappears without softening
+    the photo around it.
+    """
+    core = (mask > 127).astype(np.uint8) * 255
     if core.max() == 0:
         return rgb
+    core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1)
     filled = cv2.inpaint(rgb, core, inpaintRadius=radius, flags=cv2.INPAINT_TELEA)
-    out = rgb.copy()
-    sel = core > 0
-    # Blend 70% fill / 30% original to avoid plastic smear
-    out[sel] = (
-        filled[sel].astype(np.float32) * 0.72 + rgb[sel].astype(np.float32) * 0.28
-    ).astype(np.uint8)
-    return out
+    a = cv2.GaussianBlur((core > 0).astype(np.float32), (0, 0), 0.6)[..., None]
+    out = rgb.astype(np.float32) * (1.0 - a) + filled.astype(np.float32) * a
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def smooth_fill(rgb: np.ndarray, mask: np.ndarray, *, grow: int = 3) -> np.ndarray:
+    """
+    Fill a blob sitting on a smooth backdrop (sky, wall, out-of-focus bokeh).
+
+    Telea traces visible fan-shaped streaks across areas this large. Inpainting
+    a downscaled copy and scaling the patch back up interpolates the gradient
+    instead, which is all a smooth backdrop actually contains.
+    """
+    m = (mask > 127).astype(np.uint8) * 255
+    if m.max() == 0:
+        return rgb
+    k = max(3, grow * 2 + 1)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)), 1)
+
+    h, w = rgb.shape[:2]
+    scale = max(2, int(round(min(h, w) / 128.0)))
+    sh, sw = max(16, h // scale), max(16, w // scale)
+    small = cv2.resize(rgb, (sw, sh), interpolation=cv2.INTER_AREA)
+    small_m = cv2.resize(m, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    small_m = cv2.dilate(small_m, np.ones((3, 3), np.uint8), 1)
+    if small_m.max() == 0:
+        return erase_ink(rgb, mask, radius=5)
+
+    filled = cv2.inpaint(small, small_m, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
+    up = cv2.resize(filled, (w, h), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+
+    a = cv2.GaussianBlur((m > 0).astype(np.float32), (0, 0), 2.0)[..., None]
+    out = rgb.astype(np.float32) * (1.0 - a) + up * a
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def thin_fill(rgb: np.ndarray, mask: np.ndarray, *, radius: int = 3) -> np.ndarray:
+    """Backwards-compatible alias of :func:`erase_ink`."""
+    return erase_ink(rgb, mask, radius=radius)
 
 
 def residual_strokes(

@@ -38,7 +38,7 @@ logger = logging.getLogger("clearmark.tiler")
 TILE = 512          # LaMa is trained around this; quality is best near it
 OVERLAP = 96        # px shared between neighbouring tiles for seamless blend
 WINDOW_PAD = 48     # context padding around a component before tiling
-MAX_COVERAGE = 0.35  # refuse absurd masks (whole-frame) that mean bad detection
+MAX_COVERAGE = 0.12  # only small solid logos reach here; bigger = bad detection
 MAX_WINDOWS = 24    # cap distinct inpaint windows so CPU latency stays bounded
 
 
