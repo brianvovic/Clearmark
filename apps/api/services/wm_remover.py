@@ -87,12 +87,15 @@ def remove(image: Image.Image, mask: Image.Image | None) -> Image.Image:
     if mask is None:
         return Image.fromarray(clean)
 
-    m = mask.convert("L")
-    if m.size != (W, H):
-        m = m.resize((W, H), Image.Resampling.NEAREST)
-    mbin = (np.array(m) > 100).astype(np.float32)
-    a = cv2.GaussianBlur(cv2.dilate(mbin, np.ones((3, 3), np.uint8)), (0, 0), 2.0)[..., None]
-    out = (clean.astype(np.float32) * a + rgb.astype(np.float32) * (1 - a))
+    # Hard binary mask only — soft alpha reintroduces watermark fringe colours
+    from services.mask_prep import prepare_removal_mask
+
+    m = prepare_removal_mask(mask, size=(W, H), dilate_px=8)
+    mbin = (np.array(m) > 127).astype(np.float32)[..., None]
+    # Tiny feather (1px) only for seam; core stays binary
+    a = cv2.GaussianBlur(mbin[..., 0], (0, 0), 0.8)[..., None]
+    a = np.clip(a, 0, 1)
+    out = clean.astype(np.float32) * a + rgb.astype(np.float32) * (1 - a)
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 

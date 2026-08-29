@@ -2,10 +2,9 @@
 Training-job manager for the /train page.
 
 Holds uploaded clean images on disk and runs one training job at a time in a
-background thread, exposing live progress. Kept simple and single-box (one active
-job) — matches a self-host tool. On success it writes the detector weights to
-assets/wm_detector.pt and hot-reloads services.wm_detector so removal immediately
-uses the new model.
+background thread, exposing live progress. On success it writes weights to
+assets/wm_*.pt + checkpoints/{kind}_epN.pt and status.json so a power cut
+loses at most one epoch — "Train tiếp" resumes from the highest named ckpt.
 """
 
 from __future__ import annotations
@@ -90,25 +89,50 @@ def _set(**kw):
     with _lock:
         _state.update(kw)
         _state["updated"] = time.time()
+    # Mirror live UI state into durable status.json (survives crash mid-epoch)
+    try:
+        from training.checkpoints import read_status, write_status
+
+        st = read_status()
+        for k in ("status", "progress", "loss", "message", "kind"):
+            if k in kw:
+                st[k] = kw[k]
+        write_status(st)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _model_epochs(kind: str = "detector") -> int:
-    """Cumulative epochs the given model has been trained for (0 if none)."""
-    path = _model_path(kind)
-    if not os.path.exists(path):
-        return 0
-    try:
-        import torch
+    """Highest cumulative epoch from named ckpt or rolling latest."""
+    from training.checkpoints import latest_named, resolve_resume
 
-        ck = torch.load(path, map_location="cpu")
-        return int(ck.get("trained_epochs", 0))
-    except Exception:  # noqa: BLE001
-        return 0
+    path = _model_path(kind)
+    _, ep_named = latest_named(kind)
+    resume, ep = resolve_resume(kind, path, fresh=False)
+    return max(ep_named, ep, 0)
 
 
 def status() -> dict:
     with _lock:
         s = dict(_state)
+    # Prefer durable status.json progress when a job was interrupted / just resumed
+    try:
+        from training.checkpoints import read_status
+
+        disk = read_status()
+        if disk.get("status") == "running" and s.get("status") != "running":
+            s["status"] = "running"
+            s["progress"] = float(disk.get("progress") or 0)
+            s["message"] = disk.get("message") or s.get("message") or ""
+            s["loss"] = disk.get("loss", s.get("loss"))
+            s["kind"] = disk.get("kind", s.get("kind"))
+        elif s.get("status") == "running" and disk.get("progress") is not None:
+            # Keep UI bar in sync with last saved epoch even if mid-batch
+            s["progress"] = max(float(s.get("progress") or 0), float(disk.get("progress") or 0))
+            if disk.get("message"):
+                s["message"] = disk["message"]
+    except Exception:  # noqa: BLE001
+        pass
     s["clean_count"] = count_clean()
     s["watermark_count"] = count_watermarks()
     s["has_model"] = os.path.exists(MODEL_OUT)
@@ -156,13 +180,34 @@ def start(epochs: int = 8, fresh: bool = False, kind: str = "detector") -> None:
         raise ValueError("Cần ít nhất 4 ảnh sạch để train (nên vài chục ảnh càng tốt).")
     kind = "removal" if kind == "removal" else "detector"
     path = _model_path(kind)
-    base = 0 if fresh else _model_epochs(kind)
-    target = base + epochs                       # FINAL cumulative epoch count
-    resume = None if fresh else (path if os.path.exists(path) else None)
+
+    from training.checkpoints import resolve_resume, write_status
+
+    resume, base = (None, 0) if fresh else resolve_resume(kind, path, fresh=False)
+    if fresh:
+        base = 0
+    else:
+        base = _model_epochs(kind)
+        resume, _ = resolve_resume(kind, path, fresh=False)
+
+    target = base + epochs
     _write_job(kind, target, "running")
+    write_status({
+        "status": "running", "kind": kind, "epoch": base,
+        "target_epochs": target, "base_epochs": base, "progress": 0.0,
+        "message": (
+            f"Chuẩn bị {'Removal' if kind == 'removal' else 'Detector'} — "
+            f"tiếp tục từ vòng {base} → {target}"
+            if base else f"Chuẩn bị {'Removal' if kind == 'removal' else 'Detector'}…"
+        ),
+        "latest_checkpoint": resume,
+    })
     _set(status="running", progress=0.0, loss=None, kind=kind,
-         message=f"Chuẩn bị dữ liệu ({'Removal' if kind == 'removal' else 'Detector'})…")
-    threading.Thread(target=_run, args=(epochs, resume, kind, target), daemon=True).start()
+         message=f"Chuẩn bị dữ liệu ({'Removal' if kind == 'removal' else 'Detector'}) "
+                 f"— resume epoch {base}…")
+    threading.Thread(
+        target=_run, args=(epochs, resume, kind, target, base), daemon=True
+    ).start()
 
 
 def resume_if_interrupted() -> None:
@@ -172,13 +217,34 @@ def resume_if_interrupted() -> None:
     """
     job = _read_job()
     if not job or job.get("status") != "running":
-        return
+        # Also honour status.json if train_job.json was lost but ckpt exists
+        try:
+            from training.checkpoints import read_status
+
+            st = read_status()
+            if st.get("status") == "running" and st.get("target_epochs"):
+                job = {
+                    "kind": st.get("kind", "detector"),
+                    "target_epochs": int(st["target_epochs"]),
+                    "status": "running",
+                }
+            else:
+                return
+        except Exception:  # noqa: BLE001
+            return
     kind = job.get("kind", "detector")
     target = int(job.get("target_epochs", 0))
     base = _model_epochs(kind)
     remaining = target - base
     if remaining <= 0 or count_clean() < 4:
         _write_job(kind, target, "done")
+        try:
+            from training.checkpoints import write_status
+
+            write_status({"status": "done", "kind": kind, "epoch": base,
+                          "target_epochs": target, "progress": 1.0})
+        except Exception:  # noqa: BLE001
+            pass
         return
     logger.info("Auto-resuming interrupted %s training: %d/%d epochs done, %d to go",
                 kind, base, target, remaining)
@@ -249,6 +315,17 @@ def set_model(data: bytes, kind: str = "detector") -> None:
         os.remove(tmp)
         raise ValueError(f"File .pt không đọc được hoặc hỏng: {str(exc)[:100]}") from exc
     os.replace(tmp, target)
+    # Also seed a named checkpoint so resume finds it
+    try:
+        ep = int(ck.get("trained_epochs", 0))
+        if ep > 0:
+            from training.checkpoints import named_path
+            import shutil
+
+            dest = named_path(kind, ep)
+            shutil.copy2(target, dest)
+    except Exception:  # noqa: BLE001
+        pass
     _reload(kind)
 
 
@@ -266,7 +343,7 @@ def _reload(kind: str) -> None:
         pass
 
 
-def _run(epochs: int, resume: str | None, kind: str, target: int) -> None:
+def _run(epochs: int, resume: str | None, kind: str, target: int, base: int) -> None:
     label = "Removal" if kind == "removal" else "Detector"
     try:
         if kind == "removal":
@@ -278,18 +355,29 @@ def _run(epochs: int, resume: str | None, kind: str, target: int) -> None:
             _set(progress=min(0.99, p), loss=round(loss, 4))
 
         def on_epoch(done_total: int, run_target: int, loss: float):
-            # Each finished epoch is already saved to disk by the trainer — reload
-            # it so the live system uses it immediately (auto-integrated), and show
-            # the cumulative epoch count.
             _reload(kind)
-            _set(status="running", loss=loss,
-                 message=f"{label}: đã xong & lưu vòng {done_total}/{target} "
+            pct = (done_total - base) / max(1, target - base)
+            _set(status="running", progress=min(0.99, pct), loss=loss,
+                 message=f"{label}: đã lưu checkpoint vòng {done_total}/{target} "
                          f"(loss {loss}). An toàn nếu tắt máy.")
 
-        info = _train(CLEAN_DIR, _model_path(kind), resume_from=resume,
-                      epochs=epochs, progress_cb=cb, epoch_cb=on_epoch)
+        info = _train(
+            CLEAN_DIR, _model_path(kind), resume_from=resume,
+            epochs=epochs, progress_cb=cb, epoch_cb=on_epoch,
+            target_epochs=target, base_epochs=base,
+        )
         _reload(kind)
         _write_job(kind, target, "done")
+        from training.checkpoints import write_status
+
+        write_status({
+            "status": "done", "kind": kind,
+            "epoch": info.get("trained_epochs", target),
+            "target_epochs": target, "base_epochs": base, "progress": 1.0,
+            "loss": info.get("final_loss"),
+            "message": f"Xong {label}! Loss {info.get('final_loss')}, tổng "
+                       f"{info.get('trained_epochs')} vòng.",
+        })
         _set(status="done", progress=1.0, loss=info.get("final_loss"),
              message=f"Xong {label}! Loss {info.get('final_loss')}, tổng "
                      f"{info.get('trained_epochs')} vòng. Model đã tự tích hợp, sẵn sàng xóa.")

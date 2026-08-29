@@ -104,7 +104,7 @@ def inpaint_fullres(original: Image.Image, mask: Image.Image) -> Image.Image:
     m = mask.convert("L")
     if m.size != (W, H):
         m = m.resize((W, H), Image.Resampling.NEAREST)
-    _, mask_bin = cv2.threshold(np.array(m), 100, 255, cv2.THRESH_BINARY)
+    _, mask_bin = cv2.threshold(np.array(m), 127, 255, cv2.THRESH_BINARY)
 
     coverage = float((mask_bin > 0).mean())
     logger.info("fullres inpaint coverage=%.4f%% size=%dx%d", 100.0 * coverage, W, H)

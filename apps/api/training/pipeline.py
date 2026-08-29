@@ -314,9 +314,12 @@ def _build_unet():
 
 
 def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
-          epochs: int = 8, batch: int = 8, progress_cb=None, epoch_cb=None) -> dict:
+          epochs: int = 8, batch: int = 8, progress_cb=None, epoch_cb=None,
+          target_epochs: int | None = None, base_epochs: int | None = None) -> dict:
     import torch
     from torch.utils.data import DataLoader, Dataset
+
+    from training.checkpoints import read_status, resolve_resume, save_epoch, write_status
 
     assets = load_wm_assets()
     files = _list_clean(clean_dir)
@@ -344,10 +347,10 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
     dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = _build_unet().to(dev)
-    # Continual / resume: warm-start from an existing checkpoint so training is
-    # ADDITIVE across sessions instead of starting over. Because clean images
-    # accumulate on disk, each resume trains on the FULL set (old + new) → the
-    # model keeps improving without forgetting.
+
+    if not resume_from:
+        resume_from, _ = resolve_resume("detector", out_path, fresh=False)
+
     prev_epochs = 0
     if resume_from and os.path.exists(resume_from):
         try:
@@ -358,11 +361,26 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
         except Exception as exc:  # noqa: BLE001
             logger.warning("could not resume from %s: %s", resume_from, exc)
     opt = torch.optim.Adam(net.parameters(), 1e-3)
+    if resume_from and os.path.exists(resume_from):
+        try:
+            ck = torch.load(resume_from, map_location=dev)
+            if ck.get("optimizer"):
+                opt.load_state_dict(ck["optimizer"])
+        except Exception:  # noqa: BLE001
+            pass
     bce = torch.nn.BCEWithLogitsLoss()
 
     def dice(logits, y):
         p = torch.sigmoid(logits)
         return 1 - (2 * (p * y).sum() + 1) / (p.sum() + y.sum() + 1)
+
+    run_target = target_epochs if target_epochs is not None else prev_epochs + epochs
+    base = base_epochs if base_epochs is not None else prev_epochs
+    write_status({
+        "status": "running", "kind": "detector", "epoch": prev_epochs,
+        "target_epochs": run_target, "base_epochs": base, "progress": 0.0,
+        "message": f"Detector: tiếp tục từ vòng {prev_epochs} → {run_target}",
+    })
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     net.train()
@@ -379,22 +397,43 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
             run += float(loss.item())
             step += 1
             if progress_cb and step % 2 == 0:
-                progress_cb(step / total, float(loss.item()))
+                # Map mid-epoch progress onto cumulative target for the UI bar
+                frac = (ep + step / max(1, total / max(1, epochs))) / max(1, epochs)
+                run_done = (prev_epochs - base) + frac * epochs
+                run_total = max(1, run_target - base)
+                progress_cb(min(0.99, run_done / run_total), float(loss.item()))
         hist.append(run / len(dl))
         total_epochs = prev_epochs + ep + 1
-        # CHECKPOINT AFTER EVERY EPOCH — a crash loses at most this one epoch, and
-        # the model is immediately usable/integrated at its current level.
-        tmp = out_path + ".tmp"
-        torch.save({"state": net.state_dict(), "img_size": IMG_SIZE,
-                    "trained_epochs": total_epochs}, tmp)
-        os.replace(tmp, out_path)
-        logger.info("epoch %d/%d loss=%.4f -> saved (%d total epochs)",
+        # Named + rolling checkpoint every epoch — power loss loses ≤1 epoch
+        save_epoch(
+            "detector",
+            total_epochs,
+            net.state_dict(),
+            latest_path=out_path,
+            optimizer_state=opt.state_dict(),
+            loss=round(hist[-1], 4),
+            target_epochs=run_target,
+            extra={"img_size": IMG_SIZE, "base_epochs": base},
+        )
+        st = read_status()
+        st["base_epochs"] = base
+        st["target_epochs"] = run_target
+        write_status(st)
+        logger.info("epoch %d/%d loss=%.4f -> detector_ep%d.pt",
                     ep + 1, epochs, hist[-1], total_epochs)
         if epoch_cb:
-            epoch_cb(total_epochs, prev_epochs + epochs, round(hist[-1], 4))
+            epoch_cb(total_epochs, run_target, round(hist[-1], 4))
         if progress_cb:
-            progress_cb((ep + 1) / epochs, hist[-1])
+            run_done = total_epochs - base
+            run_total = max(1, run_target - base)
+            progress_cb(min(0.99, run_done / run_total), hist[-1])
 
+    write_status({
+        "status": "done", "kind": "detector", "epoch": prev_epochs + epochs,
+        "target_epochs": run_target, "base_epochs": base, "progress": 1.0,
+        "loss": round(hist[-1], 4) if hist else None,
+        "message": f"Detector xong — tổng {prev_epochs + epochs} vòng.",
+    })
     return {"final_loss": round(hist[-1], 4) if hist else None, "epochs": epochs,
             "trained_epochs": prev_epochs + epochs, "resumed": prev_epochs > 0,
             "samples": len(files), "wm_assets": len(assets)}

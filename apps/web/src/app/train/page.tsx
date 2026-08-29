@@ -256,7 +256,7 @@ export default function TrainPage() {
         <li><strong className="text-[var(--ink)]">1.</strong> Tải lên nhiều <strong>ảnh SẠCH</strong> (chưa có watermark). Hệ thống tự dán logo hoalau.xyz vào để tạo dữ liệu học.</li>
         <li><strong className="text-[var(--ink)]">2.</strong> Bấm <strong>Bắt đầu train</strong> — chạy trên GPU máy bạn, xem tiến độ.</li>
         <li><strong className="text-[var(--ink)]">3.</strong> Xong là model tự dùng cho trang xóa. Tải model (.pt) về để backup.</li>
-        <li><strong className="text-[var(--ink)]">4.</strong> <strong>Học cộng dồn:</strong> hôm sau tải thêm ảnh &amp; train tiếp — AI <strong>không học lại từ đầu</strong> mà cộng dồn vào cùng một file, ngày càng thông minh. Mất file thì tải file cũ lên để train tiếp.</li>
+        <li><strong className="text-[var(--ink)]">4.</strong> <strong>Học cộng dồn + chống mất điện:</strong> mỗi vòng train tự lưu <code className="text-xs">detector_epN.pt</code> / <code className="text-xs">removal_epN.pt</code> + <code className="text-xs">status.json</code>. Sập nguồn → mở lại → bấm <em>Train tiếp</em> là tiếp từ epoch cao nhất, không học lại từ đầu. Removal train bằng <strong>L1+LPIPS+GAN</strong> (chống blur). Xóa thật mặc định dùng <strong>Detector → mask binary+dilate → LaMa</strong> (kiểu Dewatermark).</li>
       </ol>
 
       {/* Current models — always visible so you know what's integrated */}

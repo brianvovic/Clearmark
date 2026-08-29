@@ -85,10 +85,10 @@ def detect(image: Image.Image, thresh: float = 0.5) -> Image.Image:
         prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
     m = (prob >= thresh).astype(np.uint8) * 255
     m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-    # clean + grow slightly to cover the soft glow edge
+    # Hard binary + light clean only — dilate happens once in engine.erase
+    # (prepare_removal_mask) so we don't double-grow and smear.
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    if m.max():
-        m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), 1)
+    _, m = cv2.threshold(m, 127, 255, cv2.THRESH_BINARY)
     return Image.fromarray(m, "L")
 
 

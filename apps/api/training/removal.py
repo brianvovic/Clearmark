@@ -1,19 +1,13 @@
 """
-End-to-end REMOVAL model — learns watermarked → clean directly.
+End-to-end REMOVAL model — watermarked → clean.
 
-Unlike the detector (which only finds WHERE the watermark is, then LaMa fills the
-hole), this network learns to RECONSTRUCT the clean pixels: it predicts a residual
-that, added to the watermarked image, cancels the watermark and rebuilds what was
-underneath. Trained on the same free synthetic pairs — synthesize() gives the
-watermarked image AND we already have the clean source, so it's fully supervised.
+Loss (anti-blur):
+  L_total = λ_l1 * weighted_L1  +  λ_lpips * LPIPS  +  λ_gan * adversarial
 
-Residual learning (clean = input + Δ) is easy to optimise and keeps untouched
-areas near-identity. L1 loss, weighted higher inside the watermark so the model
-spends its capacity where it matters.
+Pure L1 makes the net "lazy" (average/blur to minimise pixel error). LPIPS + a
+small PatchGAN force texture and sharpness inside the watermark region.
 
-Quality is DATA-BOUND: with few images it blurs; with thousands of clean stock
-photos (see scrape_clean.py) + many epochs it sharpens. Weights → assets/
-wm_remover.pt, used by services.wm_remover.
+Checkpoints: every epoch → checkpoints/removal_epN.pt + assets/wm_remover.pt
 """
 
 from __future__ import annotations
@@ -25,9 +19,15 @@ import random
 import numpy as np
 from PIL import Image
 
+from training.checkpoints import resolve_resume, save_epoch
 from training.pipeline import IMG_SIZE, _list_clean, load_wm_assets, synthesize
 
 logger = logging.getLogger("clearmark.removal")
+
+# Loss weights — LPIPS is the main anti-blur signal
+_L1_W = 0.6
+_LPIPS_W = 0.8
+_GAN_W = 0.05
 
 
 def build_removal_net():
@@ -40,7 +40,7 @@ def build_removal_net():
         )
 
     class RemovalUNet(nn.Module):
-        """Predicts a residual in [-1,1]; clean = clamp(input + residual)."""
+        """Predicts residual in [-1,1]; clean = clamp(input + residual)."""
 
         def __init__(self):
             super().__init__()
@@ -71,9 +71,66 @@ def build_removal_net():
     return RemovalUNet()
 
 
+def build_discriminator():
+    """Lightweight PatchGAN — classifies 70×70 patches as real/fake."""
+    import torch.nn as nn
+
+    def cblock(i, o, stride=2):
+        return nn.Sequential(
+            nn.Conv2d(i, o, 4, stride=stride, padding=1),
+            nn.BatchNorm2d(o),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+
+    class PatchDisc(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv2d(3, 32, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),
+                cblock(32, 64),
+                cblock(64, 128),
+                nn.Conv2d(128, 1, 4, 1, 1),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    return PatchDisc()
+
+
+class _LpipsLoss:
+    """Lazy LPIPS wrapper (AlexNet). Falls back to None if package missing."""
+
+    def __init__(self, device: str):
+        self.ok = False
+        self.net = None
+        try:
+            import lpips
+
+            self.net = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+            for p in self.net.parameters():
+                p.requires_grad_(False)
+            self.ok = True
+            logger.info("LPIPS perceptual loss enabled")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LPIPS unavailable (%s) — training with L1+GAN only", exc)
+
+    def __call__(self, pred, target):
+        import torch
+
+        if not self.ok:
+            return pred.new_zeros(())
+        # LPIPS expects [-1, 1]
+        a = pred * 2 - 1
+        b = target * 2 - 1
+        return self.net(a, b).mean()
+
+
 def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = None,
-                  epochs: int = 10, batch: int = 6, progress_cb=None, epoch_cb=None) -> dict:
+                  epochs: int = 10, batch: int = 6, progress_cb=None, epoch_cb=None,
+                  target_epochs: int | None = None, base_epochs: int | None = None) -> dict:
     import torch
+    import torch.nn.functional as F
     from torch.utils.data import DataLoader, Dataset
 
     assets = load_wm_assets()
@@ -96,50 +153,134 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
                                   augment=False)
             x = torch.from_numpy(wm).permute(2, 0, 1).float() / 255.0
             y = torch.from_numpy(clean).permute(2, 0, 1).float() / 255.0
-            w = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0) * 4 + 1  # weight in wm
+            w = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0) * 6 + 1
             return x, y, w
 
     steps_per = max(2, min(len(files) * 3, 6000) // batch)
     dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = build_removal_net().to(dev)
+    disc = build_discriminator().to(dev)
+    lpips_fn = _LpipsLoss(dev)
+
+    # Prefer explicit resume_from, else highest named checkpoint
+    if not resume_from:
+        resume_from, _ = resolve_resume("removal", out_path, fresh=False)
+
     prev_epochs = 0
     if resume_from and os.path.exists(resume_from):
         try:
             ck = torch.load(resume_from, map_location=dev)
             net.load_state_dict(ck["state"])
             prev_epochs = int(ck.get("trained_epochs", 0))
+            if ck.get("optimizer"):
+                pass  # loaded below after opt create
             logger.info("removal resumed from %s (%d epochs)", resume_from, prev_epochs)
         except Exception as exc:  # noqa: BLE001
             logger.warning("removal resume failed: %s", exc)
-    opt = torch.optim.Adam(net.parameters(), 8e-4)
+
+    opt = torch.optim.Adam(net.parameters(), 5e-4, betas=(0.5, 0.999))
+    opt_d = torch.optim.Adam(disc.parameters(), 2e-4, betas=(0.5, 0.999))
+    if resume_from and os.path.exists(resume_from):
+        try:
+            ck = torch.load(resume_from, map_location=dev)
+            if ck.get("optimizer"):
+                opt.load_state_dict(ck["optimizer"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    from training.checkpoints import read_status, write_status
+
+    run_target = (target_epochs if target_epochs is not None else prev_epochs + epochs)
+    base = base_epochs if base_epochs is not None else prev_epochs
+    write_status({
+        "status": "running", "kind": "removal", "epoch": prev_epochs,
+        "target_epochs": run_target, "base_epochs": base, "progress": 0.0,
+        "message": f"Removal: tiếp tục từ vòng {prev_epochs} → {run_target} (L1+LPIPS+GAN)",
+    })
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     net.train()
+    disc.train()
     hist, step, total = [], 0, epochs * len(dl)
+
     for ep in range(epochs):
         run = 0.0
         for x, y, w in dl:
             x, y, w = x.to(dev), y.to(dev), w.to(dev)
+
+            # ---- Generator ----
             opt.zero_grad()
             pred = net(x)
-            loss = (torch.abs(pred - y) * w).mean()
-            loss.backward()
+            l1 = (torch.abs(pred - y) * w).mean()
+            # LPIPS on full image — forces texture / sharpness vs lazy blur
+            perc = lpips_fn(pred, y)
+            fake_logits = disc(pred)
+            gan_g = F.binary_cross_entropy_with_logits(
+                fake_logits, torch.ones_like(fake_logits)
+            )
+            loss_g = _L1_W * l1 + _LPIPS_W * perc + _GAN_W * gan_g
+            loss_g.backward()
             opt.step()
-            run += float(loss.item())
+
+            # ---- Discriminator ----
+            opt_d.zero_grad()
+            real_logits = disc(y.detach())
+            fake_logits_d = disc(pred.detach())
+            loss_d = 0.5 * (
+                F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+                + F.binary_cross_entropy_with_logits(fake_logits_d, torch.zeros_like(fake_logits_d))
+            )
+            loss_d.backward()
+            opt_d.step()
+
+            run += float(loss_g.item())
             step += 1
             if progress_cb and step % 2 == 0:
-                progress_cb(step / total, float(loss.item()))
+                frac = (ep + (step % max(1, len(dl))) / max(1, len(dl))) / max(1, epochs)
+                run_done = (prev_epochs - base) + frac * epochs
+                run_total = max(1, run_target - base)
+                progress_cb(min(0.99, run_done / run_total), float(loss_g.item()))
+
         hist.append(run / len(dl))
         total_epochs = prev_epochs + ep + 1
-        tmp = out_path + ".tmp"  # checkpoint every epoch (crash-safe)
-        torch.save({"state": net.state_dict(), "img_size": IMG_SIZE, "trained_epochs": total_epochs}, tmp)
-        os.replace(tmp, out_path)
-        logger.info("removal epoch %d/%d L1=%.4f -> saved (%d total)", ep + 1, epochs, hist[-1], total_epochs)
-        if epoch_cb:
-            epoch_cb(total_epochs, prev_epochs + epochs, round(hist[-1], 4))
-        if progress_cb:
-            progress_cb((ep + 1) / epochs, hist[-1])
+        save_epoch(
+            "removal",
+            total_epochs,
+            net.state_dict(),
+            latest_path=out_path,
+            optimizer_state=opt.state_dict(),
+            loss=round(hist[-1], 4),
+            target_epochs=run_target,
+            extra={"img_size": IMG_SIZE, "base_epochs": base},
+        )
+        st = read_status()
+        st["base_epochs"] = base
+        st["target_epochs"] = run_target
+        write_status(st)
 
-    return {"final_loss": round(hist[-1], 4) if hist else None, "epochs": epochs,
-            "trained_epochs": prev_epochs + epochs, "resumed": prev_epochs > 0, "samples": len(files)}
+        logger.info(
+            "removal epoch %d/%d loss=%.4f (L1+LPIPS+GAN) -> ckpt ep%d",
+            ep + 1, epochs, hist[-1], total_epochs,
+        )
+        if epoch_cb:
+            epoch_cb(total_epochs, run_target, round(hist[-1], 4))
+        if progress_cb:
+            run_done = total_epochs - base
+            run_total = max(1, run_target - base)
+            progress_cb(min(0.99, run_done / run_total), hist[-1])
+
+    write_status({
+        "status": "done", "kind": "removal", "epoch": prev_epochs + epochs,
+        "target_epochs": run_target, "base_epochs": base, "progress": 1.0,
+        "loss": round(hist[-1], 4) if hist else None,
+        "message": f"Removal xong — tổng {prev_epochs + epochs} vòng (L1+LPIPS+GAN).",
+    })
+    return {
+        "final_loss": round(hist[-1], 4) if hist else None,
+        "epochs": epochs,
+        "trained_epochs": prev_epochs + epochs,
+        "resumed": prev_epochs > 0,
+        "samples": len(files),
+        "losses": "L1+LPIPS+GAN",
+    }

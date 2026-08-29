@@ -167,9 +167,18 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
 def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Image.Image:
     """Remove everything under ``mask`` at full resolution.
 
-    ``mode``: "smart" uses the trained removal model when present; "fast" uses the
-    lightweight LaMa tiler; "pro" prefers the SDXL diffusion path (worker/local).
+    Mask is always hard-binarized + dilated (5–10px) before any fill — soft /
+    gradient masks cause fringe colour bleed and blotchy blur.
+
+    ``mode``: "smart" uses LaMa inpainting (texture rebuild) and optionally the
+    trained remover when ``USE_TRAINED_REMOVER=1``; "fast" = LaMa only; "pro" =
+    SDXL when available.
     """
+    from services.mask_prep import prepare_removal_mask
+
+    # CRITICAL: binary 0/255 + dilate so fill bites into clean background
+    mask = prepare_removal_mask(mask, size=original.size, dilate_px=8)
+
     if worker_url():
         try:
             png = _post(
@@ -194,18 +203,50 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
         except Exception as exc:  # noqa: BLE001
             logger.warning("SDXL PRO failed, falling back: %s", exc)
 
-    # Trained end-to-end removal model (learns to rebuild the background). Applied
-    # only inside the mask, so untouched areas stay pixel-faithful. Skipped in fast.
-    if mode != "fast":
+    # Default: LaMa hole-fill (real inpainting / texture). Pure L1-trained remover
+    # tends to blur — only use it when explicitly opted in after LPIPS retrain.
+    use_trained = os.getenv("USE_TRAINED_REMOVER", "0").strip() in ("1", "true", "yes")
+    if mode != "fast" and use_trained:
         try:
             from services import wm_remover
 
             if wm_remover.available():
-                return wm_remover.remove(original, mask)
+                rem = wm_remover.remove(original, mask)
+                # LaMa polish on same dilated mask — restores high-frequency texture
+                # where the residual net smeared
+                lama = inpaint_fullres(original, mask)
+                return _blend_prefer_texture(original, rem, lama, mask)
         except Exception as exc:  # noqa: BLE001
             logger.warning("removal model failed, using LaMa: %s", exc)
 
     return inpaint_fullres(original, mask)
+
+
+def _blend_prefer_texture(
+    original: Image.Image, rem: Image.Image, lama: Image.Image, mask: Image.Image
+) -> Image.Image:
+    """Inside mask, keep the fill with higher local variance (sharper texture)."""
+    o = np.asarray(original.convert("RGB"), dtype=np.float32)
+    r = np.asarray(rem.convert("RGB"), dtype=np.float32)
+    l = np.asarray(lama.convert("RGB"), dtype=np.float32)
+    m = (np.asarray(mask.convert("L")) > 127).astype(np.float32)[..., None]
+    # Local std as a cheap sharpness proxy (blurry patches have low variance)
+    def local_std(x: np.ndarray) -> np.ndarray:
+        gray = x.mean(axis=2)
+        mu = cv2_blur(gray, 9)
+        mu2 = cv2_blur(gray * gray, 9)
+        return np.sqrt(np.maximum(mu2 - mu * mu, 0.0))
+
+    def cv2_blur(g: np.ndarray, k: int) -> np.ndarray:
+        import cv2
+
+        return cv2.GaussianBlur(g, (k, k), 0)
+
+    sr, sl = local_std(r), local_std(l)
+    prefer_lama = (sl >= sr * 0.95).astype(np.float32)[..., None]
+    filled = r * (1 - prefer_lama) + l * prefer_lama
+    out = o * (1 - m) + filled * m
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
 def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
