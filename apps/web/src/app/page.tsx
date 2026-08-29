@@ -989,9 +989,9 @@ export default function HomePage() {
                 {mode === "auto" && (
                   <div className="flex flex-wrap gap-2">
                     {([
-                      { id: "fast", label: "Nhanh", hint: "LaMa · nhẹ, tức thì" },
-                      { id: "smart", label: "Thông minh", hint: "AI đã train · tốt nhất" },
-                      { id: "pro", label: "PRO", hint: "SDXL · ảnh khó (nếu bật)" },
+                      { id: "fast", label: "An toàn", hint: "Ít đụng mặt/da · 1 vòng · LaMa" },
+                      { id: "smart", label: "Thông minh", hint: "Union detect · multi-pass · hard→SDXL" },
+                      { id: "pro", label: "Mạnh", hint: "Aggressive · SDXL + nhiều vòng (nếu bật)" },
                     ] as const).map((m) => (
                       <button
                         key={m.id}

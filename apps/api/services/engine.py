@@ -227,8 +227,8 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
     """
     from services.mask_prep import prepare_removal_mask
 
-    # CRITICAL: binary 0/255 + dilate so fill bites into clean background
-    mask = prepare_removal_mask(mask, size=original.size, dilate_px=8)
+    # CRITICAL: binary 0/255 + edge-aware dilate so fill bites into clean background
+    mask = prepare_removal_mask(mask, size=original.size, mode=mode)
 
     if worker_url():
         try:
@@ -244,18 +244,16 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU erase failed, falling back to local: %s", exc)
 
-    # PRO: local SDXL diffusion inpainting for hard cases (heavy — only if enabled).
+    # PRO: always prefer SDXL when enabled
     if mode == "pro":
         try:
             from services import sdxl
 
             if sdxl.available():
-                return sdxl.inpaint(original, mask)
+                return _maybe_sharpen(sdxl.inpaint(original, mask), mask)
         except Exception as exc:  # noqa: BLE001
             logger.warning("SDXL PRO failed, falling back: %s", exc)
 
-    # Default: LaMa hole-fill (real inpainting / texture). Pure L1-trained remover
-    # tends to blur — only use it when explicitly opted in after LPIPS retrain.
     use_trained = os.getenv("USE_TRAINED_REMOVER", "0").strip() in ("1", "true", "yes")
     if mode != "fast" and use_trained:
         try:
@@ -263,14 +261,64 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
 
             if wm_remover.available():
                 rem = wm_remover.remove(original, mask)
-                # LaMa polish on same dilated mask — restores high-frequency texture
-                # where the residual net smeared
                 lama = inpaint_fullres(original, mask)
-                return _blend_prefer_texture(original, rem, lama, mask)
+                return _maybe_sharpen(
+                    _blend_prefer_texture(original, rem, lama, mask), mask
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("removal model failed, using LaMa: %s", exc)
 
-    return inpaint_fullres(original, mask)
+    # Default LaMa tiling
+    result = inpaint_fullres(original, mask)
+
+    # Hard-case escalate: large mask or strong residual ghost → SDXL if available
+    if mode == "smart" and _is_hard_case(original, result, mask):
+        try:
+            from services import sdxl
+
+            if sdxl.available():
+                logger.info("hard case → escalating to SDXL inpaint")
+                result = sdxl.inpaint(original, mask)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SDXL escalate skipped: %s", exc)
+
+    return _maybe_sharpen(result, mask)
+
+
+def _is_hard_case(original: Image.Image, filled: Image.Image, mask: Image.Image) -> bool:
+    """Large hole or still-ghosty residual after LaMa → worth a diffusion pass."""
+    m = np.asarray(mask.convert("L")) > 127
+    cov = float(m.mean()) if m.size else 0.0
+    if cov >= 0.08:  # big logo / banner
+        return True
+    if not m.any():
+        return False
+    o = np.asarray(original.convert("RGB"), dtype=np.float32)
+    f = np.asarray(filled.convert("RGB"), dtype=np.float32)
+    # High-frequency leftover: filled still looks like original in mask (failed wipe)
+    residual = float(np.abs(f[m] - o[m]).mean())
+    return residual < 8.0  # almost unchanged under mask → LaMa barely touched it
+
+
+def _maybe_sharpen(img: Image.Image, mask: Image.Image) -> Image.Image:
+    """Optional Real-ESRGAN / unsharp only inside the mask (texture polish)."""
+    try:
+        from services import sharpen
+
+        if sharpen.available():
+            return sharpen.polish_mask(img, mask)
+    except Exception:  # noqa: BLE001
+        pass
+    # Lightweight unsharp fallback — only in mask, never global
+    import cv2
+
+    rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+    m = (np.asarray(mask.convert("L")) > 127).astype(np.float32)[..., None]
+    blur = cv2.GaussianBlur(rgb, (0, 0), 1.2)
+    sharp = np.clip(rgb + 0.35 * (rgb - blur), 0, 255)
+    out = rgb * (1 - m) + sharp * m
+    return Image.fromarray(out.astype(np.uint8))
+
 
 
 def _blend_prefer_texture(
@@ -326,7 +374,9 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
     if mode == "fast":
         return out
 
-    max_passes = max(1, int(os.getenv("ERASE_PASSES", "3")))
+    # Safe (fast) = 1 pass; smart = 3; pro/aggressive = 4
+    default_passes = {"smart": 3, "pro": 4}.get(mode, 3)
+    max_passes = max(1, int(os.getenv("ERASE_PASSES", str(default_passes))))
     for p in range(1, max_passes):
         leftover = detect_mask(out, remove_text, mode=mode)
         arr = np.asarray(leftover.convert("L"))
