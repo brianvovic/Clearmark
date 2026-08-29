@@ -84,11 +84,46 @@ def backend_label() -> str:
 # --------------------------------------------------------------------------- #
 # Detection
 # --------------------------------------------------------------------------- #
+_MAX_MASK_COVERAGE = 0.35  # refuse absurd whole-frame unions
+
+
+def _mask_ok(mask: Image.Image | np.ndarray | None, *, max_cov: float = 0.3) -> bool:
+    if mask is None:
+        return False
+    arr = np.array(mask) if not isinstance(mask, np.ndarray) else mask
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    return bool(arr.max() >= 128 and float((arr > 127).mean()) <= max_cov)
+
+
+def _union_masks(size: tuple[int, int], *masks: Image.Image | None) -> Image.Image | None:
+    """OR-combine binary masks; return None if empty or absurdly large."""
+    acc = np.zeros((size[1], size[0]), dtype=np.uint8)
+    any_hit = False
+    for m in masks:
+        if m is None:
+            continue
+        a = m.convert("L")
+        if a.size != size:
+            a = a.resize(size, Image.Resampling.NEAREST)
+        arr = np.asarray(a)
+        hit = arr > 127
+        if hit.any():
+            any_hit = True
+            acc[hit] = 255
+    if not any_hit:
+        return None
+    if float((acc > 0).mean()) > _MAX_MASK_COVERAGE:
+        return None
+    return Image.fromarray(acc, mode="L")
+
+
 def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
     """Return an L-mode mask (white = remove) at the ORIGINAL resolution.
 
-    ``mode``: "smart" (default) uses the trained detector + Florence-2 for best
-    accuracy; "fast" skips them and uses only the instant colour/heuristic mask.
+    ``mode``: "smart" (default) **unions** trained detector + Florence + neon +
+    heuristic so multi-watermark images don't miss whole logos; "fast" is
+    heuristic/neon only.
     """
     if worker_url():
         try:
@@ -104,61 +139,77 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU detect failed, falling back to local: %s", exc)
 
-    # Best when trained: the learned watermark detector generalises to any
-    # position / scale / tiling. Used as the primary detector once a model exists.
-    # Skipped in "fast" mode (heuristic only).
+    size = original.size
+    parts: list[Image.Image] = []
+    fallback: Image.Image | None = None
+
+    # 1) Trained detector — general logos / tiles / opacity
     try:
         from services import wm_detector
 
         if mode != "fast" and wm_detector.available():
             mask = wm_detector.detect(original)
-            arr = np.array(mask)
-            if arr.max() >= 128 and float((arr > 0).mean()) <= 0.3:
-                return mask
+            if _mask_ok(mask):
+                parts.append(mask)
+                fallback = fallback or mask
     except Exception as exc:  # noqa: BLE001
         logger.warning("trained detector failed: %s", exc)
 
-    # Fast heuristic pass: neon / saturated-colour watermark strokes (magenta/cyan
-    # semi-transparent logos & text over skin). Near-instant and very precise for
-    # this common case — no GPU needed, and it does NOT touch the skin underneath.
+    # 2) Neon / saturated colour strokes
     try:
         from services.mask import neon_watermark_mask
 
         neon = neon_watermark_mask(np.array(original.convert("RGB")))
-        if neon.max() >= 128 and float((neon > 0).mean()) <= 0.25:
-            # If the known hoalau.xyz logo can be aligned, use it to complete the
-            # mask (fills the white neon cores the colour rule misses).
+        if _mask_ok(neon, max_cov=0.25):
             try:
                 from services import deblend
 
                 completed = deblend.aligned_mask(original, neon)
-                if completed is not None:
-                    return completed
+                if completed is not None and _mask_ok(completed):
+                    parts.append(completed)
+                    fallback = fallback or completed
+                else:
+                    nimg = Image.fromarray(neon, mode="L")
+                    parts.append(nimg)
+                    fallback = fallback or nimg
             except Exception as exc:  # noqa: BLE001
                 logger.warning("aligned_mask failed: %s", exc)
-            return Image.fromarray(neon, mode="L")
+                nimg = Image.fromarray(neon, mode="L")
+                parts.append(nimg)
+                fallback = fallback or nimg
     except Exception as exc:  # noqa: BLE001
         logger.warning("neon detect failed: %s", exc)
 
-    # Local GPU: Florence-2 open-vocabulary watermark detector (accurate; skips
-    # faces). Falls through to the legacy heuristic if the model isn't present.
+    # 3) Florence-2 open-vocab (when installed)
     try:
         from services import florence
 
         if mode != "fast" and florence.available():
             mask = florence.detect(original, remove_text)
-            if np.array(mask).max() >= 128:
-                return mask
-            # Florence found nothing → try the heuristic as a second opinion.
+            if _mask_ok(mask):
+                parts.append(mask)
+                fallback = fallback or mask
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Florence detect failed, using heuristic: %s", exc)
+        logger.warning("Florence detect failed: %s", exc)
 
-    # Legacy heuristic: detect on a fast downscaled copy, upscale to native size.
-    small = _maybe_downscale(original, 2048)
-    mask = build_auto_mask(small, remove_text=remove_text)
-    if mask.size != original.size:
-        mask = mask.resize(original.size, Image.Resampling.NEAREST)
-    return mask
+    # 4) Legacy colour/OCR heuristic
+    try:
+        small = _maybe_downscale(original, 2048)
+        mask = build_auto_mask(small, remove_text=remove_text)
+        if mask.size != size:
+            mask = mask.resize(size, Image.Resampling.NEAREST)
+        if _mask_ok(mask):
+            parts.append(mask)
+            fallback = fallback or mask
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("heuristic detect failed: %s", exc)
+
+    united = _union_masks(size, *parts)
+    if united is not None:
+        return united
+    if fallback is not None:
+        return fallback
+    return Image.new("L", size, 0)
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +301,11 @@ def _blend_prefer_texture(
 
 
 def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
+    """Detect → erase, then re-detect leftovers and erase again (multi-pass).
+
+    Handles images with many watermarks where pass-1 only clears some of them.
+    Caps passes via ``ERASE_PASSES`` (default 3). Fast mode = single pass.
+    """
     mask = detect_mask(original, remove_text, mode=mode)
     if np.array(mask).max() < 128:
         hint = "chữ/logo mờ" if remove_text else "logo/watermark màu"
@@ -265,7 +321,33 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
                 mask = sam_refine.refine(original, mask)
         except Exception as exc:  # noqa: BLE001
             logger.warning("SAM refine skipped: %s", exc)
-    return erase(original, mask, mode=mode)
+
+    out = erase(original, mask, mode=mode)
+    if mode == "fast":
+        return out
+
+    max_passes = max(1, int(os.getenv("ERASE_PASSES", "3")))
+    for p in range(1, max_passes):
+        leftover = detect_mask(out, remove_text, mode=mode)
+        arr = np.asarray(leftover.convert("L"))
+        if arr.max() < 128:
+            break
+        cov = float((arr > 127).mean())
+        # Ignore tiny noise speckles and absurd full-frame false positives
+        if cov < 5e-5 or cov > _MAX_MASK_COVERAGE:
+            break
+        if mode != "fast":
+            try:
+                from services import sam_refine
+
+                if sam_refine.available():
+                    leftover = sam_refine.refine(out, leftover)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.info("erase multi-pass %d/%d — leftover coverage %.3f%%",
+                    p + 1, max_passes, cov * 100)
+        out = erase(out, leftover, mode=mode)
+    return out
 
 
 # --------------------------------------------------------------------------- #
