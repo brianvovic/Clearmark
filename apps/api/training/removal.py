@@ -30,7 +30,8 @@ _LPIPS_W = 0.8
 _GAN_W = 0.05
 
 
-def build_removal_net():
+def build_removal_net(in_ch: int = 4):
+    """U-Net residual remover. Default 4-ch = RGB + binary mask (mask-conditioned)."""
     import torch.nn as nn
 
     def block(i, o):
@@ -40,11 +41,14 @@ def build_removal_net():
         )
 
     class RemovalUNet(nn.Module):
-        """Predicts residual in [-1,1]; clean = clamp(input + residual)."""
+        """Predicts residual on RGB; clean = clamp(rgb + residual). Mask channel is guidance only."""
 
-        def __init__(self):
+        def __init__(self, channels: int):
             super().__init__()
-            self.d1, self.d2, self.d3, self.d4 = block(3, 32), block(32, 64), block(64, 128), block(128, 256)
+            self.in_ch = channels
+            self.d1, self.d2, self.d3, self.d4 = (
+                block(channels, 32), block(32, 64), block(64, 128), block(128, 256)
+            )
             self.pool = nn.MaxPool2d(2)
             self.mid = block(256, 384)
             self.up4 = nn.ConvTranspose2d(384, 256, 2, 2); self.u4 = block(512, 256)
@@ -57,6 +61,7 @@ def build_removal_net():
         def forward(self, x):
             import torch
 
+            rgb = x[:, :3]
             c1 = self.d1(x)
             c2 = self.d2(self.pool(c1))
             c3 = self.d3(self.pool(c2))
@@ -66,10 +71,40 @@ def build_removal_net():
             y = self.u3(torch.cat([self.up3(y), c3], 1))
             y = self.u2(torch.cat([self.up2(y), c2], 1))
             y = self.u1(torch.cat([self.up1(y), c1], 1))
-            return torch.clamp(x + self.act(self.out(y)), 0, 1)
+            return torch.clamp(rgb + self.act(self.out(y)), 0, 1)
 
-    return RemovalUNet()
+    return RemovalUNet(in_ch)
 
+
+def adapt_state_dict_in_ch(state: dict, target_in_ch: int = 4) -> dict:
+    """Expand/shrink first conv when migrating 3-ch ↔ 4-ch checkpoints."""
+    import torch
+
+    key = "d1.0.weight"
+    if key not in state:
+        return state
+    w = state[key]
+    src = int(w.shape[1])
+    if src == target_in_ch:
+        return state
+    out = dict(state)
+    if src == 3 and target_in_ch == 4:
+        # Zero-init mask channel so warm-start ≈ old RGB behaviour
+        nw = torch.zeros(w.shape[0], 4, w.shape[2], w.shape[3], dtype=w.dtype)
+        nw[:, :3] = w
+        out[key] = nw
+        logger.info("adapted removal weights 3ch → 4ch (mask channel zero-init)")
+    elif src == 4 and target_in_ch == 3:
+        out[key] = w[:, :3].contiguous()
+        logger.info("adapted removal weights 4ch → 3ch")
+    return out
+
+
+def infer_in_ch(state: dict, default: int = 4) -> int:
+    w = state.get("d1.0.weight")
+    if w is None:
+        return default
+    return int(w.shape[1])
 
 def build_discriminator():
     """Lightweight PatchGAN — classifies 70×70 patches as real/fake."""
@@ -147,19 +182,24 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
             return self.n
 
         def __getitem__(self, i):
+            import torch
+
             p = self.paths[i % len(self.paths)]
             clean = np.array(Image.open(p).convert("RGB").resize((IMG_SIZE, IMG_SIZE)))
             wm, mask = synthesize(clean, assets, random.Random(i * 11 + base_rng.randint(0, 1 << 20)),
                                   augment=False)
-            x = torch.from_numpy(wm).permute(2, 0, 1).float() / 255.0
+            rgb = torch.from_numpy(wm).permute(2, 0, 1).float() / 255.0
+            # 4th channel = hard binary mask so the net knows WHERE to rebuild
+            mch = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0)
+            x = torch.cat([rgb, mch], dim=0)
             y = torch.from_numpy(clean).permute(2, 0, 1).float() / 255.0
-            w = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0) * 6 + 1
+            w = mch * 6 + 1
             return x, y, w
 
     steps_per = max(2, min(len(files) * 3, 6000) // batch)
     dl = DataLoader(DS(files, steps_per * batch), batch_size=batch, shuffle=True, num_workers=0)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net = build_removal_net().to(dev)
+    net = build_removal_net(4).to(dev)
     disc = build_discriminator().to(dev)
     lpips_fn = _LpipsLoss(dev)
 
@@ -171,11 +211,10 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
     if resume_from and os.path.exists(resume_from):
         try:
             ck = torch.load(resume_from, map_location=dev)
-            net.load_state_dict(ck["state"])
+            state = adapt_state_dict_in_ch(ck["state"], 4)
+            net.load_state_dict(state)
             prev_epochs = int(ck.get("trained_epochs", 0))
-            if ck.get("optimizer"):
-                pass  # loaded below after opt create
-            logger.info("removal resumed from %s (%d epochs)", resume_from, prev_epochs)
+            logger.info("removal resumed from %s (%d epochs, 4ch mask-cond)", resume_from, prev_epochs)
         except Exception as exc:  # noqa: BLE001
             logger.warning("removal resume failed: %s", exc)
 
@@ -196,7 +235,7 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
     write_status({
         "status": "running", "kind": "removal", "epoch": prev_epochs,
         "target_epochs": run_target, "base_epochs": base, "progress": 0.0,
-        "message": f"Removal: tiếp tục từ vòng {prev_epochs} → {run_target} (L1+LPIPS+GAN)",
+        "message": f"Removal: tiếp tục từ vòng {prev_epochs} → {run_target} (4ch+L1+LPIPS+GAN)",
     })
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -252,7 +291,7 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
             optimizer_state=opt.state_dict(),
             loss=round(hist[-1], 4),
             target_epochs=run_target,
-            extra={"img_size": IMG_SIZE, "base_epochs": base},
+            extra={"img_size": IMG_SIZE, "base_epochs": base, "in_ch": 4},
         )
         st = read_status()
         st["base_epochs"] = base
@@ -274,7 +313,7 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
         "status": "done", "kind": "removal", "epoch": prev_epochs + epochs,
         "target_epochs": run_target, "base_epochs": base, "progress": 1.0,
         "loss": round(hist[-1], 4) if hist else None,
-        "message": f"Removal xong — tổng {prev_epochs + epochs} vòng (L1+LPIPS+GAN).",
+        "message": f"Removal xong — tổng {prev_epochs + epochs} vòng (4ch mask-cond + L1+LPIPS+GAN).",
     })
     return {
         "final_loss": round(hist[-1], 4) if hist else None,
@@ -282,5 +321,6 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
         "trained_epochs": prev_epochs + epochs,
         "resumed": prev_epochs > 0,
         "samples": len(files),
-        "losses": "L1+LPIPS+GAN",
+        "losses": "4ch+L1+LPIPS+GAN",
+        "in_ch": 4,
     }

@@ -301,9 +301,12 @@ def set_model(data: bytes, kind: str = "detector") -> None:
             raise ValueError("File này là model DETECTOR, nhưng bạn đang chọn ô 'Removal'. "
                              "Hãy bấm ô 'Detector — tìm watermark' rồi tải lại.")
         if kind == "removal":
-            from training.removal import build_removal_net
+            from training.removal import adapt_state_dict_in_ch, build_removal_net
 
-            build_removal_net().load_state_dict(ck["state"])
+            state = adapt_state_dict_in_ch(ck["state"], 4)
+            build_removal_net(4).load_state_dict(state)
+            ck["state"] = state
+            ck["in_ch"] = 4
         else:
             from training.pipeline import _build_unet
 
@@ -314,6 +317,11 @@ def set_model(data: bytes, kind: str = "detector") -> None:
     except Exception as exc:  # noqa: BLE001
         os.remove(tmp)
         raise ValueError(f"File .pt không đọc được hoặc hỏng: {str(exc)[:100]}") from exc
+    # Re-write adapted checkpoint for removal so inference gets in_ch=4
+    if kind == "removal":
+        import torch
+
+        torch.save(ck, tmp)
     os.replace(tmp, target)
     # Also seed a named checkpoint so resume finds it
     try:
