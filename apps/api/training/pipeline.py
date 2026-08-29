@@ -39,9 +39,14 @@ _ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 WATERMARKS_DIR = os.path.join(_ASSETS, "watermarks")
 os.makedirs(WATERMARKS_DIR, exist_ok=True)
 
-_WORDS = ["hoalau.xyz", "SAMPLE", "©2024", "PREVIEW", "watermark", "DEMO", "mysite.com",
-          "NOT FOR SALE", "@user_name", "COPYRIGHT", "xyz.com", "FREE", "★VIP★", "18+",
-          "sample.net", "do not copy", "PROOF", "★", "♥", "웹사이트"]
+_WORDS = [
+    "hoalau.xyz", "SAMPLE", "©2024", "PREVIEW", "watermark", "DEMO", "mysite.com",
+    "NOT FOR SALE", "@user_name", "COPYRIGHT", "xyz.com", "FREE", "★VIP★", "18+",
+    "sample.net", "do not copy", "PROOF", "★", "♥", "웹사이트",
+    "gaigu", "ONLYFANS", "PRIVATE", "LEAK", "hot18", "fullvideo", "download",
+    "share", "© ALL RIGHTS", "xxx.com", "PRIVATE PHOTO",
+]
+
 _FONT_CACHE: list[str] | None = None
 _FONT_OBJ: dict = {}
 
@@ -57,6 +62,61 @@ def _get_font(path: str | None, size: int):
         if len(_FONT_OBJ) < 800:
             _FONT_OBJ[key] = f
     return f
+
+
+def _rand_color(rng: random.Random, soft: bool = False) -> tuple[int, int, int]:
+    # vivid watermarks by default; soft = pale/faded (harder to detect)
+    h = rng.randint(0, 179)
+    if soft:
+        hsv = np.uint8([[[h, rng.randint(40, 140), rng.randint(120, 220)]]])
+    else:
+        hsv = np.uint8([[[h, rng.randint(120, 255), rng.randint(180, 255)]]])
+    b, g, r = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+    return int(r), int(g), int(b)
+
+
+def _text_watermark(rng: random.Random) -> Image.Image:
+    from PIL import ImageFilter
+
+    txt = rng.choice(_WORDS)
+    if rng.random() < 0.3:
+        txt = "".join(rng.choice(string.ascii_letters + ".·/_@-") for _ in range(rng.randint(4, 14)))
+    size = rng.randint(22, 110)
+    font = _get_font(rng.choice(_fonts()) if _fonts() else None, size)
+    dummy = Image.new("RGBA", (10, 10))
+    d = ImageDraw.Draw(dummy)
+    try:
+        bbox = d.textbbox((0, 0), txt, font=font)
+    except Exception:  # noqa: BLE001
+        bbox = (0, 0, size * len(txt) // 2, size)
+    tw, th = bbox[2] - bbox[0] + 24, bbox[3] - bbox[1] + 24
+    img = Image.new("RGBA", (max(8, tw), max(8, th)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    multicolor = rng.random() < 0.35
+    outline = rng.random() < 0.4
+    soft = rng.random() < 0.35          # faded / semi-transparent look (gaigu-style)
+    neon = rng.random() < 0.25
+    alpha = rng.randint(70, 200) if soft else 255
+
+    if multicolor:
+        x = 12
+        for ch in txt:
+            c = _rand_color(rng, soft=False) if neon else _rand_color(rng, soft=soft)
+            d.text((x, 10), ch, font=font, fill=(*c, alpha),
+                   stroke_width=2 if outline else 0,
+                   stroke_fill=(255, 255, 255, min(255, alpha + 40)))
+            x += d.textlength(ch, font=font)
+    else:
+        c = _rand_color(rng, soft=False) if neon else _rand_color(rng, soft=soft)
+        d.text((12, 10), txt, font=font, fill=(*c, alpha),
+               stroke_width=2 if outline else 0,
+               stroke_fill=(255, 255, 255, min(255, alpha + 40)))
+
+    if soft or rng.random() < 0.35:
+        img = img.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.35, 1.8)))
+    if rng.random() < 0.55:
+        img = img.rotate(rng.uniform(-40, 40), expand=True, resample=Image.BICUBIC)
+    return img
 
 
 # --------------------------------------------------------------------------- #
@@ -75,47 +135,6 @@ def _fonts() -> list[str]:
                 fonts += glob.glob(os.path.join(d, "**", ext), recursive=True)
     _FONT_CACHE = fonts[:200] if fonts else []
     return _FONT_CACHE
-
-
-def _rand_color(rng: random.Random) -> tuple[int, int, int]:
-    # bias toward vivid colours (watermarks are usually saturated)
-    h = rng.randint(0, 179)
-    hsv = np.uint8([[[h, rng.randint(120, 255), rng.randint(180, 255)]]])
-    b, g, r = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
-    return int(r), int(g), int(b)
-
-
-def _text_watermark(rng: random.Random) -> Image.Image:
-    txt = rng.choice(_WORDS)
-    if rng.random() < 0.3:
-        txt = "".join(rng.choice(string.ascii_letters + ".·/") for _ in range(rng.randint(4, 12)))
-    size = rng.randint(28, 96)
-    font = _get_font(rng.choice(_fonts()) if _fonts() else None, size)
-    dummy = Image.new("RGBA", (10, 10))
-    d = ImageDraw.Draw(dummy)
-    try:
-        bbox = d.textbbox((0, 0), txt, font=font)
-    except Exception:  # noqa: BLE001
-        bbox = (0, 0, size * len(txt) // 2, size)
-    tw, th = bbox[2] - bbox[0] + 20, bbox[3] - bbox[1] + 20
-    img = Image.new("RGBA", (max(8, tw), max(8, th)), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    multicolor = rng.random() < 0.4
-    outline = rng.random() < 0.4
-    if multicolor:
-        x = 10
-        for ch in txt:
-            c = _rand_color(rng)
-            d.text((x, 8), ch, font=font, fill=(*c, 255),
-                   stroke_width=2 if outline else 0, stroke_fill=(255, 255, 255, 255))
-            x += d.textlength(ch, font=font)
-    else:
-        c = _rand_color(rng)
-        d.text((10, 8), txt, font=font, fill=(*c, 255),
-               stroke_width=2 if outline else 0, stroke_fill=(255, 255, 255, 255))
-    if rng.random() < 0.5:
-        img = img.rotate(rng.uniform(-30, 30), expand=True, resample=Image.BICUBIC)
-    return img
 
 
 def _sticker_watermark(rng: random.Random) -> Image.Image:
@@ -156,7 +175,9 @@ def _pick_watermark(assets: list[np.ndarray], rng: random.Random) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # compositing
 # --------------------------------------------------------------------------- #
-def _stamp(out: np.ndarray, mask: np.ndarray, wm: np.ndarray, x: int, y: int, opacity: float):
+def _stamp(out: np.ndarray, mask: np.ndarray, wm: np.ndarray, x: int, y: int,
+           opacity: float, blend: str = "normal"):
+    """Alpha-composite with optional Photoshop-like blend modes."""
     H, W = out.shape[:2]
     th, tw = wm.shape[:2]
     x0, y0 = max(0, x), max(0, y)
@@ -164,10 +185,27 @@ def _stamp(out: np.ndarray, mask: np.ndarray, wm: np.ndarray, x: int, y: int, op
     if x1 <= x0 or y1 <= y0:
         return
     sub = wm[y0 - y:y1 - y, x0 - x:x1 - x]
-    a = (sub[..., 3:4].astype(np.float32) / 255.0) * opacity
-    col = sub[..., :3].astype(np.float32)
-    out[y0:y1, x0:x1] = (1 - a) * out[y0:y1, x0:x1] + a * col
-    mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], (a[..., 0] > 0.05) * 255.0)
+    if sub.shape[2] == 3:
+        a = np.ones((sub.shape[0], sub.shape[1], 1), dtype=np.float32) * opacity
+        col = sub.astype(np.float32)
+    else:
+        a = (sub[..., 3:4].astype(np.float32) / 255.0) * opacity
+        col = sub[..., :3].astype(np.float32)
+    base = out[y0:y1, x0:x1]
+    bn = base / 255.0
+    cn = col / 255.0
+    if blend == "multiply":
+        blended = bn * cn
+    elif blend == "overlay":
+        blended = np.where(bn < 0.5, 2 * bn * cn, 1 - 2 * (1 - bn) * (1 - cn))
+    elif blend == "soft_light":
+        blended = (1 - 2 * cn) * bn * bn + 2 * cn * bn
+    else:
+        blended = cn
+    blended = np.clip(blended * 255.0, 0, 255)
+    out[y0:y1, x0:x1] = (1 - a) * base + a * blended
+    # Lower threshold catches faint semi-transparent ink
+    mask[y0:y1, x0:x1] = np.maximum(mask[y0:y1, x0:x1], (a[..., 0] > 0.03) * 255.0)
 
 
 def _augment(img: np.ndarray, rng: random.Random) -> np.ndarray:
@@ -199,31 +237,53 @@ def synthesize(clean: np.ndarray, assets: list[np.ndarray], rng: random.Random,
     """
     Return (watermarked_uint8, mask_uint8) with 1–3 diverse watermarks.
 
-    ``augment`` adds JPEG/noise/blur realism — great for the DETECTOR (the mask
-    stays valid). The REMOVAL model passes augment=False so its target stays a
-    clean, sharp image (it only learns to remove the watermark, not to denoise).
+    Includes soft/faded text, multiply/overlay blends, diagonal tiling, and
+    hard low-opacity cases (~30%) so the detector learns real-world watermarks.
     """
     H, W = clean.shape[:2]
     out = clean.astype(np.float32).copy()
     mask = np.zeros((H, W), np.float32)
+    blends = ("normal", "normal", "multiply", "overlay", "soft_light")
     for _ in range(rng.randint(1, 3)):
         wm = _pick_watermark(assets, rng)
-        if rng.random() < 0.3:  # some watermarks are themselves blurry/low-res
+        if rng.random() < 0.3:
             wm = cv2.GaussianBlur(wm, (0, 0), rng.uniform(0.5, 1.6))
         lh, lw = wm.shape[:2]
-        target_w = int(W * rng.uniform(0.15, 0.6))
+        target_w = int(W * rng.uniform(0.12, 0.58))
         target_h = max(8, int(lh * target_w / max(1, lw)))
         wm_r = cv2.resize(wm, (max(8, target_w), target_h), interpolation=cv2.INTER_AREA)
-        opacity = rng.uniform(0.25, 0.9)
-        if rng.random() < 0.25:  # tiled
-            gx, gy = int(target_w * 0.5), int(target_h * 0.8)
-            for yy in range(rng.randint(0, gy), H, target_h + gy):
-                for xx in range(rng.randint(0, gx), W, wm_r.shape[1] + gx):
-                    _stamp(out, mask, wm_r, xx, yy, opacity)
+        # Hard negatives: very faint watermarks (gaigu-style)
+        if rng.random() < 0.30:
+            opacity = rng.uniform(0.12, 0.35)
         else:
-            x = rng.randint(-target_w // 6, max(1, W - target_w + target_w // 6))
-            y = rng.randint(-target_h // 6, max(1, H - target_h + target_h // 6))
-            _stamp(out, mask, wm_r, x, y, opacity)
+            opacity = rng.uniform(0.28, 0.9)
+        blend = rng.choice(blends)
+        mode = rng.random()
+        if mode < 0.18:  # diagonal / repeating tile
+            gap_x = int(target_w * rng.uniform(0.35, 1.1))
+            gap_y = int(target_h * rng.uniform(0.45, 1.2))
+            # Rotate tile for diagonal feel
+            if rng.random() < 0.7:
+                ang = rng.uniform(25, 45) * (1 if rng.random() < 0.5 else -1)
+                pil = Image.fromarray(wm_r if wm_r.shape[2] == 4 else
+                                      np.dstack([wm_r, np.full(wm_r.shape[:2], 255, np.uint8)]))
+                pil = pil.rotate(ang, expand=True, resample=Image.BICUBIC)
+                wm_r = np.array(pil)
+                target_h, target_w = wm_r.shape[:2]
+            sx = rng.randint(-gap_x // 2, max(1, gap_x))
+            sy = rng.randint(-gap_y // 2, max(1, gap_y))
+            for yy in range(sy, H + target_h, target_h + gap_y):
+                for xx in range(sx, W + target_w, wm_r.shape[1] + gap_x):
+                    _stamp(out, mask, wm_r, xx, yy, opacity, blend)
+        elif mode < 0.40:  # axis-aligned tile
+            gx, gy = int(target_w * 0.5), int(target_h * 0.8)
+            for yy in range(rng.randint(0, max(1, gy)), H, target_h + gy):
+                for xx in range(rng.randint(0, max(1, gx)), W, wm_r.shape[1] + gx):
+                    _stamp(out, mask, wm_r, xx, yy, opacity, blend)
+        else:
+            x = rng.randint(-target_w // 5, max(1, W - target_w + target_w // 5))
+            y = rng.randint(-target_h // 5, max(1, H - target_h + target_h // 5))
+            _stamp(out, mask, wm_r, x, y, opacity, blend)
     result = np.clip(out, 0, 255).astype(np.uint8)
     if augment:
         result = _augment(result, rng)
@@ -241,7 +301,7 @@ def _list_clean(clean_dir: str) -> list[str]:
 def make_sample(clean_path: str, assets: list[np.ndarray], rng: random.Random):
     img = Image.open(clean_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
     clean = np.array(img)
-    if rng.random() < 0.1:  # clean negative → fewer false positives
+    if rng.random() < 0.12:  # clean negative → fewer false positives
         return clean, np.zeros((IMG_SIZE, IMG_SIZE), np.uint8)
     return synthesize(clean, assets, rng)
 
