@@ -121,8 +121,6 @@ def _union_masks(size: tuple[int, int], *masks: Image.Image | None) -> Image.Ima
 
 def _thin_components(mask: np.ndarray, *, max_thick: float = 14.0) -> np.ndarray:
     """Keep only thin connected components (text/strokes); drop fat body blobs."""
-    import cv2
-
     m = (mask > 127).astype(np.uint8)
     if m.max() == 0:
         return m
@@ -135,18 +133,13 @@ def _thin_components(mask: np.ndarray, *, max_thick: float = 14.0) -> np.ndarray
         comp = (labels == i).astype(np.uint8)
         dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
         thick = float(dist.max() * 2)
-        # Fat blob over body (thick > max) → reject; thin text/logo strokes keep
         if thick <= max_thick or area < 400:
             out[comp > 0] = 255
     return out
 
 
 def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
-    """Return an L-mode mask (white = remove) at the ORIGINAL resolution.
-
-    On person-heavy photos, prefer thin neon/OCR strokes and reject fat detector
-    blobs that would wipe skin/clothes.
-    """
+    """Detect watermark mask. On body: thin strokes only — never fat blobs."""
     if worker_url():
         try:
             png = _post(
@@ -161,97 +154,87 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU detect failed, falling back to local: %s", exc)
 
+    from services.body_region import body_mask, thin_strokes_on_body
+
     size = original.size
     rgb = np.array(original.convert("RGB"))
-    from services.mask import protect_mask
-
-    person = float((protect_mask(rgb) > 0).mean()) > 0.06
+    body = body_mask(rgb, dilate_px=16)
+    person = float((body > 0).mean()) > 0.05
     parts: list[Image.Image] = []
     fallback: Image.Image | None = None
 
     def _accept(mask_img: Image.Image | np.ndarray, *, max_cov: float = 0.3) -> Image.Image | None:
         if isinstance(mask_img, np.ndarray):
-            arr = mask_img
-            if arr.ndim == 3:
-                arr = arr[..., 0]
-            img = Image.fromarray(arr.astype(np.uint8), mode="L")
+            arr = mask_img if mask_img.ndim == 2 else mask_img[..., 0]
         else:
-            img = mask_img.convert("L")
-            arr = np.asarray(img)
+            arr = np.asarray(mask_img.convert("L"))
         if not _mask_ok(arr, max_cov=max_cov):
             return None
         if person:
-            thin = _thin_components(arr, max_thick=12.0 if mode == "fast" else 16.0)
+            # Body: only thin strokes; bg parts of same mask also filtered
+            thin = thin_strokes_on_body(
+                arr, body,
+                max_thick=12.0 if mode == "fast" else 16.0,
+                max_body_cov=0.06,
+            )
             if thin.max() == 0:
                 return None
-            # Drop if almost all of the mask lands on skin/face (body wipe risk)
-            keep = protect_mask(rgb)
-            on_person = float((keep[thin > 0] > 0).mean()) if (thin > 0).any() else 0.0
-            cov = float((thin > 0).mean())
-            if on_person > 0.85 and cov > 0.04:
-                # Huge skin-covering blob — refuse
-                return None
-            img = Image.fromarray(thin, mode="L")
-        return img
+            return Image.fromarray(thin, mode="L")
+        thin = _thin_components(arr, max_thick=18.0)
+        return Image.fromarray(thin if thin.max() else arr, mode="L")
 
-    # 1) Trained detector — skip on fast; on person photos keep only thin parts
+    # 1) Trained detector
     try:
         from services import wm_detector
 
         if mode != "fast" and wm_detector.available():
-            mask = wm_detector.detect(original)
-            ok = _accept(mask, max_cov=0.2 if person else 0.3)
+            ok = _accept(wm_detector.detect(original), max_cov=0.18 if person else 0.3)
             if ok is not None:
                 parts.append(ok)
                 fallback = fallback or ok
     except Exception as exc:  # noqa: BLE001
         logger.warning("trained detector failed: %s", exc)
 
-    # 2) Neon strokes — usually thin & accurate on body overlays
+    # 2) Neon
     try:
         from services.mask import neon_watermark_mask
 
         neon = neon_watermark_mask(rgb)
-        ok = _accept(neon, max_cov=0.2)
+        ok = _accept(neon, max_cov=0.18)
         if ok is not None:
+            parts.append(ok)
+            fallback = fallback or ok
             try:
                 from services import deblend
 
-                completed = deblend.aligned_mask(original, np.asarray(ok))
-                cok = _accept(completed, max_cov=0.2) if completed is not None else None
+                completed = deblend.aligned_mask(original, neon)
+                cok = _accept(completed, max_cov=0.18) if completed is not None else None
                 if cok is not None:
                     parts.append(cok)
-                    fallback = fallback or cok
-                else:
-                    parts.append(ok)
-                    fallback = fallback or ok
             except Exception:  # noqa: BLE001
-                parts.append(ok)
-                fallback = fallback or ok
+                pass
     except Exception as exc:  # noqa: BLE001
         logger.warning("neon detect failed: %s", exc)
 
-    # 3) Florence — often returns fat boxes; skip on person photos / fast
+    # 3) Florence — skip on person (fat boxes)
     try:
         from services import florence
 
-        if mode not in ("fast",) and not person and florence.available():
-            mask = florence.detect(original, remove_text)
-            ok = _accept(mask, max_cov=0.25)
+        if mode != "fast" and not person and florence.available():
+            ok = _accept(florence.detect(original, remove_text), max_cov=0.25)
             if ok is not None:
                 parts.append(ok)
                 fallback = fallback or ok
     except Exception as exc:  # noqa: BLE001
         logger.warning("Florence detect failed: %s", exc)
 
-    # 4) Heuristic (+ OCR when remove_text)
+    # 4) Heuristic — OCR only when user opted in (never auto on person)
     try:
         small = _maybe_downscale(original, 2048)
-        # On person photos always allow text OCR for faint "gaigu"-style marks
-        mask = build_auto_mask(small, remove_text=remove_text or person)
+        mask = build_auto_mask(small, remove_text=remove_text)
         if mask.size != size:
             mask = mask.resize(size, Image.Resampling.NEAREST)
-        ok = _accept(mask, max_cov=0.2 if person else 0.3)
+        ok = _accept(mask, max_cov=0.18 if person else 0.3)
         if ok is not None:
             parts.append(ok)
             fallback = fallback or ok
@@ -261,7 +244,9 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
     united = _union_masks(size, *parts)
     if united is not None:
         if person:
-            thin = _thin_components(np.asarray(united), max_thick=14.0)
+            thin = thin_strokes_on_body(
+                np.asarray(united), body, max_thick=16.0, max_body_cov=0.06
+            )
             if thin.max():
                 return Image.fromarray(thin, mode="L")
         return united
@@ -270,53 +255,51 @@ def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -
     return Image.new("L", size, 0)
 
 
-# --------------------------------------------------------------------------- #
-# Removal
-# --------------------------------------------------------------------------- #
 def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Image.Image:
-    """Remove watermark under ``mask`` without destroying people.
-
-    Pixels on face/skin/body → frequency-separation peel (keep texture).
-    Background only → LaMa / optional SDXL. Never run diffusion on a person.
     """
-    from services.attenuate import peel_overlay
-    from services.mask import protect_mask
+    A) mask_body / mask_bg split
+    B) body → peel/deblend only (+ residual 2nd peel on smart/pro)
+    C) bg → LaMa; smart may SDXL; pro SDXL/Flux
+    Never LaMa/SDXL on body.
+    """
+    from services.attenuate import peel_overlay, residual_strokes
+    from services.body_region import body_mask, split_watermark_mask, thin_strokes_on_body
     from services.mask_prep import prepare_removal_mask
 
     rgb = np.asarray(original.convert("RGB"))
-    # Minimal dilate + subject guard
+    body = body_mask(rgb, dilate_px=16)
+
+    # Prep mask: binary + tiny dilate, then re-thin on body
     mask = prepare_removal_mask(mask, size=original.size, mode=mode, rgb=original)
     m = np.asarray(mask.convert("L"))
+    m = thin_strokes_on_body(m, body, max_thick=16.0, max_body_cov=0.07)
     if m.max() < 128:
         return original.convert("RGB")
 
-    keep = protect_mask(rgb)  # face + skin
-    # Grow keep so bikini / cloth next to skin is also peel-only (not LaMa-smear)
-    if keep.max():
-        keep_body = cv2.dilate(
-            keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (41, 41)), 1
-        )
-    else:
-        keep_body = keep
-    on_person = (m > 127) & (keep_body > 0)
-    off_person = (m > 127) & (keep_body == 0)
-
+    on_body, on_bg = split_watermark_mask(m, body)
     out = rgb.copy()
 
-    # --- Person: peel only (never LaMa/SDXL) ---
-    if on_person.any():
-        person_mask = np.zeros_like(m)
-        person_mask[on_person] = 255
-        peeled = peel_overlay(out, person_mask)
-        out[on_person] = peeled[on_person]
-        logger.info("peeled %d person px (no LaMa/SDXL on body)", int(on_person.sum()))
+    # ----- BODY: peel only -----
+    if on_body.max():
+        out = peel_overlay(out, on_body)
+        logger.info("body peel %d px", int((on_body > 0).sum()))
 
-    # --- Background: classic inpaint ---
-    if off_person.any():
-        bg_mask = np.zeros_like(m)
-        bg_mask[off_person] = 255
+        # Residual check → second peel (smart/pro), still no LaMa
+        if mode in ("smart", "pro"):
+            resid = residual_strokes(out, body)
+            resid = cv2.bitwise_and(resid, on_body)  # stay inside first mask neighbourhood
+            # Also allow tiny new residual near original strokes
+            near = cv2.dilate(on_body, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), 1)
+            resid = cv2.bitwise_and(resid, near)
+            resid = thin_strokes_on_body(resid, body, max_thick=8.0, max_body_cov=0.015)
+            if resid.max():
+                logger.info("body residual peel %d px", int((resid > 0).sum()))
+                out = peel_overlay(out, resid)
+
+    # ----- BG: LaMa / SDXL -----
+    if on_bg.max():
         bg_img = Image.fromarray(out)
-        bg_m = Image.fromarray(bg_mask, mode="L")
+        bg_m = Image.fromarray(on_bg, mode="L")
 
         if worker_url():
             try:
@@ -329,46 +312,34 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
                     data={"predict_mode": "4.0" if mode == "pro" else os.getenv("GPU_PREDICT_MODE", "3.0")},
                 )
                 filled = np.asarray(Image.open(io.BytesIO(png)).convert("RGB"))
-                out[off_person] = filled[off_person]
+                out[on_bg > 0] = filled[on_bg > 0]
                 return Image.fromarray(out)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("GPU erase failed, local bg fill: %s", exc)
+                logger.warning("GPU erase failed: %s", exc)
 
         if mode == "pro":
-            try:
-                from services import flux
+            for modname in ("flux", "sdxl"):
+                try:
+                    mod = __import__(f"services.{modname}", fromlist=["available", "inpaint"])
+                    if mod.available():
+                        filled = np.asarray(mod.inpaint(bg_img, bg_m).convert("RGB"))
+                        out[on_bg > 0] = filled[on_bg > 0]
+                        return Image.fromarray(out)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("%s bg failed: %s", modname, exc)
 
-                if flux.available():
-                    filled = np.asarray(flux.inpaint(bg_img, bg_m).convert("RGB"))
-                    out[off_person] = filled[off_person]
-                    return Image.fromarray(out)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Flux failed: %s", exc)
+        filled = np.asarray(inpaint_fullres(bg_img, bg_m).convert("RGB"))
+        out[on_bg > 0] = filled[on_bg > 0]
+
+        if mode == "smart" and _should_escalate_sdxl(bg_img, Image.fromarray(out), bg_m):
             try:
                 from services import sdxl
 
                 if sdxl.available():
                     filled = np.asarray(sdxl.inpaint(bg_img, bg_m).convert("RGB"))
-                    out[off_person] = filled[off_person]
-                    return Image.fromarray(out)
+                    out[on_bg > 0] = filled[on_bg > 0]
             except Exception as exc:  # noqa: BLE001
-                logger.warning("SDXL failed: %s", exc)
-
-        filled = np.asarray(inpaint_fullres(bg_img, bg_m).convert("RGB"))
-        out[off_person] = filled[off_person]
-
-        # Smart: escalate bg-only residual to SDXL (still never on person)
-        if mode == "smart":
-            bg_only = Image.fromarray(bg_mask, mode="L")
-            if _should_escalate_sdxl(bg_img, Image.fromarray(out), bg_only):
-                try:
-                    from services import sdxl
-
-                    if sdxl.available() and _mask_skin_overlap(bg_only, original) < 0.05:
-                        filled = np.asarray(sdxl.inpaint(bg_img, bg_m).convert("RGB"))
-                        out[off_person] = filled[off_person]
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("SDXL bg escalate skipped: %s", exc)
+                logger.warning("SDXL bg escalate skipped: %s", exc)
 
     return Image.fromarray(out)
 

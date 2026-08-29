@@ -1,9 +1,12 @@
 """
-Peel translucent watermarks WITHOUT destroying skin / fabric texture.
+Peel / attenuate translucent watermarks on skin & clothing.
 
-LaMa/SDXL replace pixels → blur or invent missing limbs when the mask sits on a
-person. Frequency separation keeps high-frequency detail (pores, weave) from the
-original and only swaps the low-frequency tint that watermarks usually add.
+Never uses LaMa or SDXL. Pipeline:
+  1) Restrict to thin stroke core
+  2) Estimate local background B and alpha a
+  3) Unblend: B ≈ (I - a·W) / (1-a) with W≈I (ink colour ≈ observed)
+  4) Re-inject high-frequency detail from the original (pores / fabric)
+  5) residual_strokes() — thin leftover ink after peel for an optional 2nd peel
 """
 
 from __future__ import annotations
@@ -13,40 +16,81 @@ import numpy as np
 from PIL import Image
 
 
-def peel_overlay(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    ``rgb`` HxWx3 uint8, ``mask`` HxW {0,255}. Outside mask is bit-exact original.
-    """
-    m = (mask > 127).astype(np.uint8)
+def _stroke_core(mask: np.ndarray) -> np.ndarray:
+    m = (mask > 127).astype(np.uint8) * 255
     if m.max() == 0:
+        return m
+    core = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    if core.max() == 0:
+        core = m
+    return cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1)
+
+
+def peel_overlay(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Alpha-aware peel; outside mask is bit-exact original."""
+    core = _stroke_core(mask)
+    if core.max() == 0:
         return rgb
 
-    # Thin the mask — only peel the stroke core, not a fat blob of skin
-    core = cv2.morphologyEx(m * 255, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-    if core.max() == 0:
-        core = m * 255
-    # Tiny dilate so soft glyph edges are covered
-    core = cv2.dilate(core, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1)
-
     orig = rgb.astype(np.float32)
-    # Low-freq guide: Telea on a slim mask estimates clean colour under the ink
-    guide = cv2.inpaint(rgb, core, inpaintRadius=2, flags=cv2.INPAINT_TELEA).astype(np.float32)
+    # Local background via small Telea — used only as B estimate, never as final
+    B = cv2.inpaint(rgb, core, inpaintRadius=2, flags=cv2.INPAINT_TELEA).astype(np.float32)
 
-    blur_o = cv2.GaussianBlur(orig, (0, 0), 1.6)
-    blur_g = cv2.GaussianBlur(guide, (0, 0), 1.6)
-    detail = orig - blur_o  # pores / cloth weave stay
-    peeled = np.clip(blur_g + detail, 0, 255)
+    # Alpha from colour distance to background (translucent ink lifts chroma/luma)
+    delta = np.abs(orig - B).mean(axis=2, keepdims=True)
+    a = np.clip(delta / 32.0, 0.0, 0.85)
+    core3 = (core > 0).astype(np.float32)[..., None]
+    a = a * core3
+    a = cv2.GaussianBlur(a, (0, 0), 0.6)
+    if a.ndim == 2:
+        a = a[..., None]
 
-    a = (core > 0).astype(np.float32)
-    a = cv2.GaussianBlur(a, (0, 0), 0.7)[..., None]
-    a = np.clip(a, 0, 1)
-    # Prefer original more when residual is small (don't over-peel clean skin)
-    delta = np.abs(orig - guide).mean(axis=2, keepdims=True)
-    conf = np.clip(delta / 18.0, 0.25, 1.0)  # stronger peel where colour differs
-    a = a * conf
+    blur_o = cv2.GaussianBlur(orig, (0, 0), 1.4)
+    blur_b = cv2.GaussianBlur(B, (0, 0), 1.4)
+    detail = orig - blur_o
+    low = blur_o * (1.0 - a) + blur_b * a
+    peeled = np.clip(low + detail, 0, 255)
 
-    out = orig * (1.0 - a) + peeled * a
+    w = (core > 0).astype(np.float32)
+    w = cv2.GaussianBlur(w, (0, 0), 0.5)
+    if w.ndim == 2:
+        w = w[..., None]
+    out = orig * (1.0 - w) + peeled * w
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def residual_strokes(
+    rgb_after: np.ndarray,
+    body: np.ndarray | None = None,
+    *,
+    min_delta: float = 12.0,
+) -> np.ndarray:
+    """
+    Thin leftover watermark ink after peel — for a second peel pass only.
+    Uses neon/chroma residual; never returns fat blobs.
+    """
+    try:
+        from services.mask import neon_watermark_mask
+
+        neon = neon_watermark_mask(rgb_after)
+    except Exception:  # noqa: BLE001
+        neon = np.zeros(rgb_after.shape[:2], np.uint8)
+
+    # Also catch pale white/pink text via local contrast
+    gray = cv2.cvtColor(rgb_after, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    local = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    hi = (np.abs(gray - local) > min_delta).astype(np.uint8) * 255
+    hi = cv2.morphologyEx(hi, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    residual = cv2.bitwise_or(neon, hi)
+    if body is not None and body.max():
+        residual = cv2.bitwise_and(residual, (body > 0).astype(np.uint8) * 255)
+
+    # Keep only thin components
+    from services.body_region import thin_strokes_on_body
+
+    body_m = body if body is not None else np.full(residual.shape, 255, np.uint8)
+    return thin_strokes_on_body(residual, body_m, max_thick=8.0, max_body_cov=0.02)
 
 
 def peel_image(image: Image.Image, mask: Image.Image) -> Image.Image:

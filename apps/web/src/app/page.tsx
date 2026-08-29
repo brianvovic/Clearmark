@@ -989,9 +989,9 @@ export default function HomePage() {
                 {mode === "auto" && (
                   <div className="flex flex-wrap gap-2">
                     {([
-                      { id: "fast", label: "An toàn", hint: "Peel trên người · LaMa nền · không SDXL" },
-                      { id: "smart", label: "Thông minh", hint: "Peel da/quần áo · LaMa nền · SDXL chỉ nền" },
-                      { id: "pro", label: "Mạnh", hint: "Peel trên người · SDXL/Flux chỉ nền" },
+                      { id: "fast", label: "An toàn", hint: "Body: chỉ peel · Nền: LaMa nhẹ" },
+                      { id: "smart", label: "Thông minh", hint: "Body: peel + residual · Nền: LaMa→SDXL" },
+                      { id: "pro", label: "Mạnh", hint: "Body: peel chặt · Nền: SDXL/Flux" },
                     ] as const).map((m) => (
                       <button
                         key={m.id}
@@ -1018,7 +1018,7 @@ export default function HomePage() {
                     <span>
                       <span className="font-semibold text-[var(--ink)]">Xóa cả chữ / watermark văn bản</span>
                       <span className="mt-0.5 block text-xs text-[var(--ink-muted)]">
-                        Mặc định tắt để không xóa nhầm chữ in thật (trên áo, bao bì, biển hiệu). Chỉ bật khi watermark là dạng chữ.
+                        Chỉ bật khi watermark là chữ (vd. gaigu). Trên ảnh người dễ bắt nhầm da/vải — ưu tiên tô thủ công vùng chữ nếu sót.
                       </span>
                     </span>
                   </label>
