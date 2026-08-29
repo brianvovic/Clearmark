@@ -22,6 +22,7 @@ _ASSETS = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
 MODEL_OUT = os.path.join(_ASSETS, "wm_detector.pt")          # detector (find mask)
 MODEL_REMOVAL = os.path.join(_ASSETS, "wm_remover.pt")       # end-to-end removal
 JOB_STATE = os.path.join(_ASSETS, "train_job.json")          # survives restarts
+SYNTH_DIR = os.path.join(_BASE, "synth")                     # offline (img, mask) pairs
 
 
 def _model_path(kind: str) -> str:
@@ -60,6 +61,51 @@ def _safe_name(filename: str) -> str:
 def save_watermark(filename: str, data: bytes) -> None:
     with open(os.path.join(WATERMARKS_DIR, _safe_name(filename)), "wb") as f:
         f.write(data)
+
+
+def start_synth_after_upload(*, num: int | None = None) -> None:
+    """
+    After new logos land in assets/watermarks, rebuild a large synth set so the
+    next Detector train sees them. Debounced: skips if already generating/training.
+    """
+    with _lock:
+        if _state["status"] in ("running", "scraping", "generating"):
+            logger.info("synth skipped — job busy (%s)", _state["status"])
+            return
+    if count_clean() < 4:
+        _set(status="idle",
+             message="Đã lưu logo. Cần ≥4 ảnh sạch rồi hệ thống sẽ auto-generate dataset.")
+        return
+    n = int(num or os.getenv("SYNTH_NUM", "20000"))
+    workers = max(1, int(os.getenv("SYNTH_WORKERS", str(max(1, (os.cpu_count() or 4) - 1)))))
+    size = int(os.getenv("SYNTH_SIZE", "384"))
+    _set(status="generating", progress=0.0, loss=None,
+         message=f"Đang tạo {n} sample học từ kho watermark…")
+    threading.Thread(
+        target=_run_synth, args=(n, workers, size), daemon=True
+    ).start()
+
+
+def _run_synth(num: int, workers: int, size: int) -> None:
+    try:
+        from training.generate_dataset import generate
+        from training.pipeline import WATERMARKS_DIR
+
+        def cb(frac: float, done: int, total: int):
+            _set(progress=min(0.99, frac),
+                 message=f"Đã tạo {done}/{total} sample synthetic…")
+
+        info = generate(
+            CLEAN_DIR, SYNTH_DIR, WATERMARKS_DIR,
+            num=num, size=size, workers=workers,
+            negative_prob=0.12, progress_cb=cb,
+        )
+        _set(status="done", progress=1.0,
+             message=f"Xong dataset: {info['created']}/{info['requested']} sample "
+                     f"({info['logos']} logo). Bấm Train tiếp Detector để học.")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("synth generate failed")
+        _set(status="error", message=f"Generate dataset lỗi: {str(exc)[:240]}")
 
 
 def count_watermarks() -> int:
@@ -174,7 +220,7 @@ def clear_clean() -> None:
 
 def start(epochs: int = 8, fresh: bool = False, kind: str = "detector") -> None:
     with _lock:
-        if _state["status"] in ("running", "scraping"):
+        if _state["status"] in ("running", "scraping", "generating"):
             raise RuntimeError("Đang bận, chờ xong đã.")
     if count_clean() < 4:
         raise ValueError("Cần ít nhất 4 ảnh sạch để train (nên vài chục ảnh càng tốt).")
@@ -257,7 +303,7 @@ def resume_if_interrupted() -> None:
 def scrape(count: int, source: str = "picsum", api_key: str | None = None,
            query: str | None = None) -> None:
     with _lock:
-        if _state["status"] in ("running", "scraping"):
+        if _state["status"] in ("running", "scraping", "generating"):
             raise RuntimeError("Đang bận, chờ xong đã.")
     _set(status="scraping", progress=0.0, message="Đang tải ảnh sạch từ internet…")
     threading.Thread(target=_run_scrape, args=(count, source, api_key, query), daemon=True).start()

@@ -244,8 +244,16 @@ def erase(original: Image.Image, mask: Image.Image, mode: str = "smart") -> Imag
         except Exception as exc:  # noqa: BLE001
             logger.warning("GPU erase failed, falling back to local: %s", exc)
 
-    # PRO: always prefer SDXL when enabled
+    # PRO: Flux (if FLUX_ENABLE=1) → else SDXL → else LaMa
     if mode == "pro":
+        try:
+            from services import flux
+
+            if flux.available():
+                logger.info("Using Flux PRO")
+                return _maybe_sharpen(flux.inpaint(original, mask), mask)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Flux failed, trying SDXL: %s", exc)
         try:
             from services import sdxl
 

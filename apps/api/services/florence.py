@@ -116,8 +116,11 @@ def _run_task(img: Image.Image, task: str, text: str) -> dict:
 
 # Phrases we ask Florence-2 to localise. Kept generic so it catches logos,
 # translucent overlays, tiled marks and corner signatures alike.
-_PHRASES = ["watermark", "logo", "translucent text overlay", "stamp", "signature"]
-_TEXT_PHRASES = ["text", "caption"]
+_PHRASES = [
+    "watermark", "logo", "translucent text overlay", "stamp", "signature",
+    "copyright", "semi-transparent text", "site watermark",
+]
+_TEXT_PHRASES = ["text", "caption", "overlay text"]
 
 
 def detect(image: Image.Image, remove_text: bool) -> Image.Image:

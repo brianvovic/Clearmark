@@ -458,7 +458,7 @@ def train_clear():
 
 @app.post("/api/train/watermarks")
 async def train_watermarks(images: List[UploadFile] = File(...)):
-    """Add logo/sticker PNGs (with transparency) to the watermark library to learn."""
+    """Add logo/sticker PNGs to the watermark library, then auto-build synth data."""
     n = 0
     for f in images:
         if not f.filename:
@@ -468,6 +468,9 @@ async def train_watermarks(images: List[UploadFile] = File(...)):
             continue
         train_jobs.save_watermark(f.filename, data)
         n += 1
+    if n > 0:
+        # Kick off 15–25k synthetic samples so Detector train sees the new logos
+        train_jobs.start_synth_after_upload()
     return {"added": n, **train_jobs.status()}
 
 

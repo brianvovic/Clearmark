@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type TrainStatus = {
-  status: "idle" | "running" | "scraping" | "done" | "error";
+  status: "idle" | "running" | "scraping" | "generating" | "done" | "error";
   progress: number;
   loss: number | null;
   message: string;
@@ -83,9 +83,13 @@ export default function TrainPage() {
     }
   }, [scrapeSource, scrapeQuery, scrapeKey]);
 
-  // Poll while a job runs (training or downloading images).
+  // Poll while a job runs (training, scraping, or synth generate).
   useEffect(() => {
-    if (status?.status !== "running" && status?.status !== "scraping") return;
+    if (
+      status?.status !== "running"
+      && status?.status !== "scraping"
+      && status?.status !== "generating"
+    ) return;
     const t = setInterval(refresh, 1200);
     return () => clearInterval(t);
   }, [status?.status, refresh]);
@@ -166,11 +170,18 @@ export default function TrainPage() {
     const files = Array.from(list).filter((f) => f.type.startsWith("image/"));
     if (!files.length) return;
     setWorking("wm");
+    setNotice(null);
     try {
       const form = new FormData();
       files.forEach((f) => form.append("images", f));
       const r = await fetch("/api/train/watermarks", { method: "POST", body: form });
-      if (r.ok) setStatus(await r.json());
+      if (r.ok) {
+        const j = await r.json();
+        setStatus(j);
+        setNotice(
+          `✓ Đã thêm ${j.added ?? files.length} logo vào kho. Hệ thống đang tự tạo ~20.000 sample học (xem thanh tiến độ).`,
+        );
+      }
     } finally {
       setWorking(null);
     }
@@ -236,7 +247,7 @@ export default function TrainPage() {
   }, []);
 
   const running = status?.status === "running";
-  const busyJob = status?.status === "running" || status?.status === "scraping";
+  const busyJob = status?.status === "running" || status?.status === "scraping" || status?.status === "generating";
   const pct = Math.round((status?.progress ?? 0) * 100);
   const modelEpochs = kind === "removal" ? status?.removal_epochs ?? 0 : status?.model_epochs ?? 0;
   const hasModel = kind === "removal" ? status?.has_removal_model : status?.has_model;
@@ -406,10 +417,10 @@ export default function TrainPage() {
             />
           </div>
         )}
-        {status?.status === "scraping" && (
+        {(status?.status === "scraping" || status?.status === "generating") && (
           <div className="mt-3">
             <div className="h-2 w-full overflow-hidden rounded-full" style={{ background: "#f3ebe4" }}>
-              <div className="h-full rounded-full" style={{ width: `${pct}%`, background: "#0e7490" }} />
+              <div className="h-full rounded-full" style={{ width: `${pct}%`, background: status.status === "generating" ? "#c2410c" : "#0e7490" }} />
             </div>
             <p className="mt-1 text-xs text-[var(--ink-muted)]">{status.message}</p>
           </div>
@@ -422,7 +433,8 @@ export default function TrainPage() {
           <div>
             <p className="text-sm font-semibold text-[var(--ink)]">Kho watermark để học ({status?.watermark_count ?? 1})</p>
             <p className="text-xs text-[var(--ink-muted)]">
-              Ngoài chữ &amp; sticker tự sinh, tải thêm <strong>logo/sticker PNG (nền trong suốt)</strong> của các bên khác để AI học xóa được cả chúng.
+              Ngoài chữ &amp; sticker tự sinh, tải thêm <strong>logo/sticker PNG (nền trong suốt)</strong>.
+              Hệ thống lưu vào kho và <strong>tự generate ~15–25k sample</strong> để Detector học.
             </p>
           </div>
           <button
