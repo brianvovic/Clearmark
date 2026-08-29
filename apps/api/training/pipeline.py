@@ -330,13 +330,26 @@ def train(clean_dir: str, out_path: str, *, resume_from: str | None = None,
     class DS(Dataset):
         def __init__(self, paths, n):
             self.paths, self.n = paths, n
+            try:
+                from training import hard_neg
+
+                self.hard = hard_neg.list_cases(400)
+            except Exception:  # noqa: BLE001
+                self.hard = []
 
         def __len__(self):
             return self.n
 
         def __getitem__(self, i):
-            p = self.paths[i % len(self.paths)]
-            img, mask = make_sample(p, assets, random.Random(i * 7 + base_rng.randint(0, 1 << 20)))
+            # ~30% hard-neg oversample when the bank has failures from kiểm chứng
+            if self.hard and (i % 10) < 3:
+                from training import hard_neg
+
+                wp, mp, _cp = self.hard[i % len(self.hard)]
+                img, mask, _ = hard_neg.load_case(wp, mp, _cp, IMG_SIZE)
+            else:
+                p = self.paths[i % len(self.paths)]
+                img, mask = make_sample(p, assets, random.Random(i * 7 + base_rng.randint(0, 1 << 20)))
             x = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
             y = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
             return x, y

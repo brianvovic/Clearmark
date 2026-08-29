@@ -177,6 +177,12 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
     class DS(Dataset):
         def __init__(self, paths, n):
             self.paths, self.n = paths, n
+            try:
+                from training import hard_neg
+
+                self.hard = hard_neg.list_cases(400)
+            except Exception:  # noqa: BLE001
+                self.hard = []
 
         def __len__(self):
             return self.n
@@ -184,12 +190,17 @@ def train_removal(clean_dir: str, out_path: str, *, resume_from: str | None = No
         def __getitem__(self, i):
             import torch
 
-            p = self.paths[i % len(self.paths)]
-            clean = np.array(Image.open(p).convert("RGB").resize((IMG_SIZE, IMG_SIZE)))
-            wm, mask = synthesize(clean, assets, random.Random(i * 11 + base_rng.randint(0, 1 << 20)),
-                                  augment=False)
+            if self.hard and (i % 10) < 3:
+                from training import hard_neg
+
+                wp, mp, cp = self.hard[i % len(self.hard)]
+                wm, mask, clean = hard_neg.load_case(wp, mp, cp, IMG_SIZE)
+            else:
+                p = self.paths[i % len(self.paths)]
+                clean = np.array(Image.open(p).convert("RGB").resize((IMG_SIZE, IMG_SIZE)))
+                wm, mask = synthesize(clean, assets, random.Random(i * 11 + base_rng.randint(0, 1 << 20)),
+                                      augment=False)
             rgb = torch.from_numpy(wm).permute(2, 0, 1).float() / 255.0
-            # 4th channel = hard binary mask so the net knows WHERE to rebuild
             mch = torch.from_numpy((mask > 0).astype("float32")).unsqueeze(0)
             x = torch.cat([rgb, mch], dim=0)
             y = torch.from_numpy(clean).permute(2, 0, 1).float() / 255.0

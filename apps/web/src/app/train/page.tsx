@@ -621,9 +621,24 @@ export default function TrainPage() {
               <span className="rounded-full px-3 py-1" style={{ background: "#f3ebe4", color: "var(--ink)" }}>
                 Còn sót (thấp = tốt): {evalMetrics.mean_residual}
               </span>
+              {evalMetrics.leftover != null && (
+                <span className="rounded-full px-3 py-1" style={{ background: "#ffedd5", color: "#c2410c" }}>
+                  Còn sót sau xóa: {evalMetrics.leftover}/{evalMetrics.samples}
+                </span>
+              )}
+              {evalMetrics.ocr_survive != null && evalMetrics.ocr_survive !== "None" && (
+                <span className="rounded-full px-3 py-1" style={{ background: "#fee2e2", color: "#b91c1c" }}>
+                  OCR vẫn đọc được: {evalMetrics.ocr_survive}/{evalMetrics.ocr_checked}
+                </span>
+              )}
               {evalMetrics.lpips && evalMetrics.lpips !== "None" && (
                 <span className="rounded-full px-3 py-1" style={{ background: "#ede9fe", color: "#6d28d9" }}>
                   LPIPS (thấp = giống ảnh gốc): {evalMetrics.lpips}
+                </span>
+              )}
+              {evalMetrics.hard_neg_bank != null && (
+                <span className="rounded-full px-3 py-1" style={{ background: "#e0f2fe", color: "#0369a1" }}>
+                  Kho hard-neg: {evalMetrics.hard_neg_bank} (train sẽ học thêm)
                 </span>
               )}
             </div>

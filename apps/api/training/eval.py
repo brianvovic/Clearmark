@@ -1,16 +1,12 @@
 """
 Proof that training worked.
 
-`evaluate()` generates held-out watermarked images (diverse: logos, text, stickers
-— the SAME variety the detector trained on), runs the REAL removal pipeline on
-each, and returns:
-  • a montage: each row is [watermarked | removed] so you can SEE it working;
-  • metrics: how many watermarks the detector localised (IoU>0.4) and the average
-    IoU, plus the average "residual" (how much watermark colour is left after
-    removal — lower is better).
+`evaluate()` synthesises held-out watermarks, runs the REAL erase_auto pipeline,
+reports detection IoU / residual / LPIPS, plus:
+  • leftover_rate — detector still fires after erase (missed / incomplete wipe)
+  • ocr_survive  — EasyOCR still reads text inside the GT mask after erase
 
-This answers "tạo bao nhiêu watermark và xóa được chưa?" with evidence rather than
-just a loss number.
+Hard failures are saved into the hard-neg bank so the next train oversamples them.
 """
 
 from __future__ import annotations
@@ -22,6 +18,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from training import hard_neg
 from training.pipeline import IMG_SIZE, _list_clean, load_wm_assets, synthesize
 
 logger = logging.getLogger("clearmark.eval")
@@ -38,8 +35,6 @@ _lpips_dev = "cpu"
 
 
 def _lpips_score(a_rgb: np.ndarray, b_rgb: np.ndarray) -> float | None:
-    """Perceptual distance (LPIPS) between two RGB images — lower = more alike.
-    Objective 'how clean is the result vs the true image', beyond pixel diff."""
     global _lpips_net, _lpips_dev
     try:
         import lpips
@@ -59,6 +54,30 @@ def _lpips_score(a_rgb: np.ndarray, b_rgb: np.ndarray) -> float | None:
         return None
 
 
+def _ocr_still_readable(removed_rgb: np.ndarray, gt_mask: np.ndarray) -> bool | None:
+    """True if EasyOCR still finds text overlapping the watermark region after erase."""
+    try:
+        from services.mask import _ocr_word_boxes
+
+        boxes = _ocr_word_boxes(removed_rgb)
+        if not boxes:
+            return False
+        gt = gt_mask > 0
+        for poly, _txt in boxes:
+            # poly is Nx2 points — rasterize rough bbox overlap
+            xs = poly[:, 0].astype(int)
+            ys = poly[:, 1].astype(int)
+            x0, x1 = max(0, xs.min()), min(removed_rgb.shape[1], xs.max() + 1)
+            y0, y1 = max(0, ys.min()), min(removed_rgb.shape[0], ys.max() + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            if gt[y0:y1, x0:x1].mean() > 0.15:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
     from services import engine, wm_detector
 
@@ -66,7 +85,8 @@ def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
     files = _list_clean(clean_dir)
     rng = random.Random()
     rows = []
-    ious, residuals, lpips_scores, detected = [], [], [], 0
+    ious, residuals, lpips_scores = [], [], []
+    detected = leftover = ocr_alive = ocr_checked = hard_saved = 0
 
     for i in range(n):
         if files:
@@ -83,21 +103,50 @@ def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
         detected += int(iou > 0.4)
 
         try:
-            removed = np.array(engine.erase_auto(pil, False).convert("RGB"))
+            removed_pil = engine.erase_auto(pil, True, mode="smart")
+            removed = np.array(removed_pil.convert("RGB"))
         except Exception:  # noqa: BLE001
+            removed_pil = pil
             removed = img.copy()
-        # residual = mean abs diff between removed and the (unknown) clean, over the
-        # watermark area — we DO know clean here, so this is a fair measure.
+
         m = gt > 0
-        residuals.append(float(np.abs(removed[m].astype(int) - clean[m].astype(int)).mean())
-                         if m.any() else 0.0)
+        residual = float(np.abs(removed[m].astype(int) - clean[m].astype(int)).mean()) if m.any() else 0.0
+        residuals.append(residual)
         lp = _lpips_score(removed, clean)
         if lp is not None:
             lpips_scores.append(lp)
 
+        # Leftover: detector still sees watermark after erase
+        try:
+            after = np.array(wm_detector.detect(removed_pil)) if wm_detector.available() else np.zeros_like(gt)
+            left_iou = _iou(after > 0, gt > 0)
+            if left_iou > 0.25 or float((after > 0).mean()) > 0.01:
+                leftover += 1
+        except Exception:  # noqa: BLE001
+            left_iou = 0.0
+
+        ocr_flag = _ocr_still_readable(removed, gt)
+        if ocr_flag is not None:
+            ocr_checked += 1
+            if ocr_flag:
+                ocr_alive += 1
+
+        # Bank hard failures for the next train
+        is_hard = (
+            iou < 0.4
+            or residual > 25.0
+            or left_iou > 0.25
+            or ocr_flag is True
+        )
+        if is_hard:
+            reason = "miss" if iou < 0.4 else ("residual" if residual > 25 else "leftover")
+            hard_neg.save_case(img, gt, clean, reason=reason)
+            hard_saved += 1
+
         row = np.concatenate([img, np.full((IMG_SIZE, 6, 3), 255, np.uint8), removed], axis=1)
         rows.append(row)
 
+    hard_neg.prune(400)
     gap = np.full((8, rows[0].shape[1], 3), 240, np.uint8)
     montage = rows[0]
     for r in rows[1:]:
@@ -110,6 +159,12 @@ def evaluate(clean_dir: str, n: int = 6) -> tuple[np.ndarray, dict]:
         "mean_iou": round(float(np.mean(ious)), 3),
         "mean_residual": round(float(np.mean(residuals)), 1),
         "lpips": round(float(np.mean(lpips_scores)), 3) if lpips_scores else None,
+        "leftover": leftover,
+        "leftover_rate": round(leftover / n, 2),
+        "ocr_survive": ocr_alive if ocr_checked else None,
+        "ocr_checked": ocr_checked,
+        "hard_neg_saved": hard_saved,
+        "hard_neg_bank": hard_neg.count(),
         "wm_assets": len(assets),
     }
     logger.info("eval %s", metrics)
