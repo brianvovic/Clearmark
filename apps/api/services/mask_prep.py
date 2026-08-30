@@ -153,6 +153,14 @@ def apply_subject_guard(
             # limb-sized blobs the guard exists to stop are not.
             img_area = float(rgb.shape[0] * rgb.shape[1])
             small_ink_max = 0.015 * img_area
+            # Only extend that courtesy to a mask that looks like lettering. A
+            # speckled mask — the shape a misfiring detector makes when it dots a
+            # face with small blobs — keeps the old thin-strokes-only rule, so it
+            # can never fill someone's eyes and mouth.
+            areas = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n)]
+            total_ink = sum(areas) or 1
+            if areas and max(areas) < 0.30 * total_ink:
+                small_ink_max = 0.0
             for i in range(1, n):
                 area = int(stats[i, cv2.CC_STAT_AREA])
                 if area < 6:

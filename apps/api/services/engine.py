@@ -138,6 +138,28 @@ def _thin_components(mask: np.ndarray, *, max_thick: float = 14.0) -> np.ndarray
     return out
 
 
+def _is_compact(mask: np.ndarray, *, min_share: float = 0.30) -> bool:
+    """
+    True when a mask looks like a watermark rather than scattered noise.
+
+    A real detection is a few solid shapes: on a watermarked photo the largest
+    component holds most of the masked area. A misfiring detector instead
+    speckles the frame — on one test photo it put dozens of small blobs across a
+    child's eyes and mouth while missing the watermark entirely, and the largest
+    of them held only a tenth of the mask. Filling that wrecks the face, so
+    fragmented masks must not be trusted with a guard-free fill.
+    """
+    m = (mask > 127).astype(np.uint8)
+    total = int(m.sum())
+    if total == 0:
+        return False
+    n, _, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return False
+    biggest = max(int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, n))
+    return biggest >= min_share * total
+
+
 def detect_mask(original: Image.Image, remove_text: bool, mode: str = "smart") -> Image.Image:
     """Union of every detector — for previews and for the session mask."""
     trusted, guess = detect_split(original, remove_text, mode=mode)
@@ -227,11 +249,12 @@ def detect_split(
         if mode != "fast" and wm_detector.available():
             ok = _accept(wm_detector.detect(original), max_cov=0.35)
             if ok is not None:
-                cov = float((np.asarray(ok) > 127).mean())
-                if 0 < cov <= 0.10:
-                    learned = ok          # tight prediction → trust it on its own
+                arr = np.asarray(ok)
+                cov = float((arr > 127).mean())
+                if 0 < cov <= 0.10 and _is_compact(arr):
+                    learned = ok          # tight, compact prediction → trust it
                 else:
-                    rough.append(ok)      # sprawling → must still prove ink
+                    rough.append(ok)      # sprawling or speckled → must prove ink
     except Exception as exc:  # noqa: BLE001
         logger.warning("trained detector failed: %s", exc)
 
@@ -318,7 +341,7 @@ def erase(
             cov = float((traw > 127).sum()) / area_img
             n_lbl, _, st, _ = cv2.connectedComponentsWithStats((traw > 127).astype(np.uint8), 8)
             biggest = max((int(st[i, cv2.CC_STAT_AREA]) for i in range(1, n_lbl)), default=0)
-            if cov <= 0.04 and biggest <= 0.02 * area_img:
+            if cov <= 0.04 and biggest <= 0.02 * area_img and _is_compact(traw):
                 grown = cv2.dilate(
                     traw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), 1
                 )
