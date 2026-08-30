@@ -331,6 +331,30 @@ def erase(
     # tight prediction from the learned detector has already earned the fill, and
     # its small, compact components cannot deform anything.
     if trusted is not None and manual is None:
+        # Only shortcut when the trusted mask is essentially the whole job. It
+        # returns immediately, so if the rest of the mask still holds a watermark
+        # we would erase a sliver and skip the real mark — which is exactly what
+        # happened on a photo whose trusted part was 0.16% and whose remaining
+        # mask was 19.5%: nothing visible got removed.
+        _mfull = np.asarray(mask.convert("L")) if isinstance(mask, Image.Image) else mask
+        if _mfull.shape != rgb.shape[:2]:
+            _mfull = cv2.resize(
+                _mfull, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
+        _traw0 = np.asarray(trusted.convert("L"))
+        if _traw0.shape != rgb.shape[:2]:
+            _traw0 = cv2.resize(
+                _traw0, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
+        _rest = ((_mfull > 127) & ~(_traw0 > 127)).mean()
+        if _rest > 0.01:
+            trusted_shortcut = False
+        else:
+            trusted_shortcut = True
+    else:
+        trusted_shortcut = False
+
+    if trusted_shortcut:
         traw = np.asarray(trusted.convert("L"))
         if traw.shape != rgb.shape[:2]:
             traw = cv2.resize(traw, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
