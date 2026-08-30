@@ -59,3 +59,6 @@ apps/api/_*.png
 # runtime training job state
 apps/api/assets/train_job.json
 apps/api/assets/*.tmp
+
+apps/api/assets/status.json
+apps/api/_dbg_*.py
