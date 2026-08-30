@@ -615,7 +615,109 @@ def erase_auto(original: Image.Image, remove_text: bool, mode: str = "smart") ->
         out = erase(
             out, leftover, mode=mode, remove_text=remove_text, trusted=left_trusted
         )
+
+    if mode == "pro":
+        out = _pro_polish(original, out, mask)
     return out
+
+
+def _pro_polish(original: Image.Image, result: Image.Image, mask: Image.Image) -> Image.Image:
+    """
+    PRO: repaint ONLY the faint residue interpolation leaves behind.
+
+    Filling a stroke by interpolation cannot reinvent skin or fabric, so a soft
+    grey ghost of the lettering survives. Diffusion can, but letting it repaint
+    the whole watermark region would also redraw parts that already came out
+    clean. So we run it strictly on what is still wrong: pixels inside the old
+    mask where the result still differs from its surroundings. Every other pixel
+    is copied through untouched, which is what makes this safe to always apply.
+    """
+    try:
+        from services import sdxl
+    except Exception:  # noqa: BLE001
+        return result
+    if not sdxl.available():
+        return result
+
+    try:
+        from services.ink import ink_within
+
+        res = np.asarray(result.convert("RGB"))
+        m = np.asarray(mask.convert("L"))
+        if m.shape != res.shape[:2]:
+            m = cv2.resize(m, (res.shape[1], res.shape[0]), interpolation=cv2.INTER_NEAREST)
+        region = cv2.dilate(
+            (m > 127).astype(np.uint8) * 255,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            1,
+        )
+        if region.max() == 0:
+            return result
+
+        ghost = ink_within(res, region, min_delta=5.0, require_uniform=False)
+        if ghost.max() == 0:
+            logger.info("pro polish: nothing left to clean")
+            return result
+        ghost = cv2.dilate(ghost, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1)
+        frac = float((ghost > 0).sum()) / float(res.shape[0] * res.shape[1])
+        if frac > 0.06:
+            logger.info("pro polish skipped: residue too broad (%.2f%%)", frac * 100)
+            return result
+
+        # Size the diffusion to the smudge. The residue is a few hundred pixels
+        # across, so a 512² pass at fewer steps is visually identical to 1024²
+        # here and finishes in a fraction of the time on an 8 GB card.
+        ys, xs = np.where(ghost > 0)
+        span = max(int(xs.max() - xs.min()), int(ys.max() - ys.min())) + 1
+        work = 512 if span <= 400 else 768
+        steps = int(os.getenv("SDXL_POLISH_STEPS", "12"))
+        logger.info(
+            "pro polish: SDXL on %.3f%% residue (span=%dpx, %d² × %d steps)",
+            frac * 100, span, work, steps,
+        )
+        painted = np.asarray(
+            sdxl.inpaint(
+                result, Image.fromarray(ghost, "L"),
+                steps=steps, work=work,
+            ).convert("RGB")
+        )
+
+        # Diffusion can invent rather than clean: asked to fix a faint smudge on
+        # skin it will happily paint leaves or jewellery there, which is worse
+        # than the smudge it replaced. Accept the repaint only when it genuinely
+        # flattened the area; if it added structure, keep what we already had.
+        sel = ghost > 0
+        # Measure how much the filled pixels stand out from the skin/fabric that
+        # rings them. A hallucinated leaf is a smooth dark shape, so it barely
+        # registers as "detail" — but it is far from the surrounding colour, which
+        # is exactly what makes it obvious to a viewer.
+        ring = cv2.dilate(
+            ghost, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)), 1
+        ) > 0
+        ring &= ~sel
+        if ring.sum() < 50:
+            return result
+        ring_mean = res[ring].astype(np.float32).mean(axis=0)
+
+        def _standout(img: np.ndarray) -> float:
+            return float(np.abs(img[sel].astype(np.float32) - ring_mean).mean())
+
+        before, after = _standout(res), _standout(painted)
+        # Demand a clear win, not a marginal one. Diffusion here is a gamble —
+        # it can hallucinate shapes onto skin — so a few percent of "improvement"
+        # is not worth the risk of trading a faint smudge for an invented object.
+        if after > before * 0.85:
+            logger.info(
+                "pro polish rejected: no clear gain (%.1f -> %.1f)", before, after
+            )
+            return result
+        logger.info("pro polish accepted: residue %.2f -> %.2f", before, after)
+        out = res.copy()
+        out[sel] = painted[sel]
+        return Image.fromarray(out)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pro polish failed, keeping result: %s", exc)
+        return result
 
 
 # --------------------------------------------------------------------------- #

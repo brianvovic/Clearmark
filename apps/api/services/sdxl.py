@@ -98,6 +98,7 @@ def inpaint(
     strength: float = 0.68,
     steps: int = 20,
     guidance_scale: float = 6.5,
+    work: int = 1024,
 ) -> Image.Image:
     """Diffusion-inpaint the masked region; outside the mask stays original."""
     pipe = _load()
@@ -128,7 +129,11 @@ def inpaint(
         )
     )
     cw, ch = crop.size
-    work = 1024
+    # Keep the working square a multiple of 8 and never upscale a small crop:
+    # diffusing a thumbnail-sized smudge at 1024² costs minutes on an 8 GB card
+    # that is already holding the other models, for no visible gain.
+    work = max(384, min(int(work), 1024))
+    work -= work % 8
 
     gen = pipe(
         prompt=prompt

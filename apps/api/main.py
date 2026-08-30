@@ -16,7 +16,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image
 
-from services import engine, sessions, storage, train_jobs, video_tasks
+# Read apps/api/.env BEFORE importing services: they read their switches
+# (SDXL_ENABLE, LAMA_DEVICE, …) at import time, so loading it later leaves the
+# file silently doing nothing.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).with_name(".env"))
+except ImportError:  # optional dependency
+    pass
+
+from services import engine, sessions, storage, train_jobs, video_tasks  # noqa: E402
 from services.lama import get_lama
 
 logging.basicConfig(level=logging.INFO)
