@@ -1,0 +1,11 @@
+{
+  "status": "done",
+  "kind": "detector",
+  "epoch": 237,
+  "target_epochs": 237,
+  "base_epochs": 149,
+  "progress": 1.0,
+  "loss": 0.3122,
+  "message": "Xong Detector! Loss 0.3122, tổng 237 vòng. Model đã tự tích hợp, sẵn sàng xóa.",
+  "updated": 1788048314.9836502
+}

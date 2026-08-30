@@ -215,26 +215,49 @@ def detect_split(
     except Exception as exc:  # noqa: BLE001
         logger.warning("heuristic detect failed: %s", exc)
 
-    # --- blobby sources (must prove ink before anything is filled) ---
+    # The trained U-Net predicts per PIXEL, so a tight prediction is as
+    # stroke-accurate as the colour rule and belongs with the trusted sources.
+    # Filing it as a "guess" let Florence's frame-sized box swallow it: the union
+    # became one huge component, got classified as a wide area on a person, and
+    # so only had its tint corrected — the watermark survived untouched.
+    learned: Image.Image | None = None
     try:
         from services import wm_detector
 
         if mode != "fast" and wm_detector.available():
             ok = _accept(wm_detector.detect(original), max_cov=0.35)
             if ok is not None:
-                rough.append(ok)
+                cov = float((np.asarray(ok) > 127).mean())
+                if 0 < cov <= 0.10:
+                    learned = ok          # tight prediction → trust it on its own
+                else:
+                    rough.append(ok)      # sprawling → must still prove ink
     except Exception as exc:  # noqa: BLE001
         logger.warning("trained detector failed: %s", exc)
 
+    # --- blobby sources (must prove ink before anything is filled) ---
+    # Florence returns grounding BOXES, not strokes. A box that covers a fifth of
+    # the frame is describing the subject, not a watermark, and merging it wrecks
+    # precise masks — so keep the ceiling far tighter than for pixel detectors.
     try:
         from services import florence
 
         if mode != "fast" and florence.available():
-            ok = _accept(florence.detect(original, remove_text), max_cov=0.35)
+            ok = _accept(florence.detect(original, remove_text), max_cov=0.12)
             if ok is not None:
                 rough.append(ok)
+            else:
+                logger.info("Florence box rejected: too coarse to be a watermark")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Florence detect failed: %s", exc)
+
+    # A trained pixel model outranks the colour rules. Unioning them was actively
+    # harmful: the neon rule flags saturated cyan, so a turquoise bikini joined the
+    # mask and got repainted, while the model had already found the real mark. Use
+    # the heuristics only to fill in where the model found nothing.
+    if learned is not None:
+        exact = [learned]
+        logger.info("using trained detector alone (colour rules stood down)")
 
     trusted = _union_masks(size, *exact) or empty
     guess = _union_masks(size, *rough) or empty
@@ -277,6 +300,37 @@ def erase(
     from services.mask_prep import person_zone, prepare_removal_mask
 
     rgb = np.asarray(original.convert("RGB"))
+
+    # Fast path, decided on the RAW trusted mask — before the subject guard runs.
+    # That guard exists to stop an unreliable mask from eating a body, so it also
+    # erodes a good one: it kept only thin, ink-verified strokes, which is why a
+    # bold semi-transparent word over skin came out of it empty and survived. A
+    # tight prediction from the learned detector has already earned the fill, and
+    # its small, compact components cannot deform anything.
+    if trusted is not None and manual is None:
+        traw = np.asarray(trusted.convert("L"))
+        if traw.shape != rgb.shape[:2]:
+            traw = cv2.resize(traw, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        _, traw = cv2.threshold(traw, 127, 255, cv2.THRESH_BINARY)
+        traw = _apply_face_protection(traw, rgb)
+        if traw.max():
+            area_img = float(rgb.shape[0] * rgb.shape[1])
+            cov = float((traw > 127).sum()) / area_img
+            n_lbl, _, st, _ = cv2.connectedComponentsWithStats((traw > 127).astype(np.uint8), 8)
+            biggest = max((int(st[i, cv2.CC_STAT_AREA]) for i in range(1, n_lbl)), default=0)
+            if cov <= 0.04 and biggest <= 0.02 * area_img:
+                grown = cv2.dilate(
+                    traw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), 1
+                )
+                logger.info("trusted direct fill: cov=%.2f%% (guard bypassed)", 100 * cov)
+                filled = np.asarray(
+                    inpaint_fullres(Image.fromarray(rgb), Image.fromarray(grown, "L"))
+                    .convert("RGB")
+                )
+                out = rgb.copy()
+                sel = grown > 127
+                out[sel] = filled[sel]
+                return Image.fromarray(out)
 
     mask = prepare_removal_mask(mask, size=original.size, mode=mode, rgb=original)
     m = np.asarray(mask.convert("L"))
@@ -327,6 +381,16 @@ def erase(
     on_body[person == 0] = 0
     if on_body.max():
         body_ink = ink_within(rgb, on_body, min_delta=8.0)
+        # Faint semi-transparent lettering sits only a few levels above skin, so
+        # the ink test finds almost none of it and the mark survived every later
+        # pass. When a stroke-accurate detector has already vouched for these
+        # exact pixels, treat them as ink — but only the compact `solid` part,
+        # never a wide band, so a bad mask still cannot repaint a body.
+        if int((body_ink > 0).sum()) < 0.25 * int((on_body > 0).sum()):
+            vouched = cv2.bitwise_and(cv2.bitwise_and(on_body, t), cv2.bitwise_not(wide))
+            if vouched.max():
+                body_ink = cv2.bitwise_or(body_ink, vouched)
+                logger.info("faint mark: trusting detector for %d px", int((vouched > 0).sum()))
         thin = cv2.bitwise_or(thin, body_ink)
         solid[person > 0] = 0
         wide[person > 0] = 0
@@ -348,16 +412,31 @@ def erase(
             if remove_text:
                 strength = min(1.4, strength + 0.1)
             out = peel_overlay(out, body_thin, strength=strength)
+            # Peel deliberately preserves high-frequency detail to protect pores
+            # and fabric — but the lettering IS high-frequency, so text on skin
+            # stayed perfectly readable after peeling. Filling the stroke core is
+            # safe here precisely because these components are thin: only the
+            # 1–2px stroke is replaced, so no limb, garment or contour can be
+            # deformed the way a wide hole-fill would.
+            if mode != "fast":
+                out = erase_ink(out, body_thin, radius=2)
         radius = 2 if mode == "fast" else 3
         bg_thin = thin.copy()
         bg_thin[person > 0] = 0
         area0 = max(1, int((thin > 0).sum()))
         if bg_thin.max():
             out = erase_ink(out, bg_thin, radius=radius)
-        resid_body = ink_within(out, body_thin if body_thin.max() else thin, min_delta=9.0)
-        resid_body[person == 0] = 0
-        if resid_body.max():
+        # Sweep leftover lettering on the body the same way the background is
+        # swept. One pass at a fixed threshold used to stop early: peel lowers the
+        # contrast just enough to fall under it while the text is still readable.
+        seed_body = body_thin if body_thin.max() else thin
+        for delta in (9.0, 6.5):
+            resid_body = ink_within(out, seed_body, min_delta=delta)
+            resid_body[person == 0] = 0
+            if not resid_body.max():
+                continue
             out = erase_ink(out, resid_body, radius=2)
+            seed_body = cv2.bitwise_or(seed_body, resid_body)
 
         rounds = 1 if mode == "fast" else (2 if mode == "smart" else 3)
         seed = bg_thin if bg_thin.max() else thin

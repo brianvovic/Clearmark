@@ -145,13 +145,22 @@ def apply_subject_guard(
                 (kept > 0).astype(np.uint8), connectivity=8
             )
             thin_only = np.zeros_like(kept)
+            # A glyph in a bold font is thicker than a "stroke" but is still a
+            # watermark, not anatomy. Keeping only thin components silently threw
+            # away bold lettering on skin — the mask went empty and the mark
+            # survived every later stage. Small ink components are therefore kept
+            # on their size as well: a letter is tiny next to the frame, while the
+            # limb-sized blobs the guard exists to stop are not.
+            img_area = float(rgb.shape[0] * rgb.shape[1])
+            small_ink_max = 0.015 * img_area
             for i in range(1, n):
-                if int(stats[i, cv2.CC_STAT_AREA]) < 6:
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if area < 6:
                     continue
                 comp = (labels == i).astype(np.uint8)
                 dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
                 thick = float(dist.max() * 2.0) if dist.size else 0.0
-                if thick <= THIN_THICK_PX:
+                if thick <= THIN_THICK_PX or area <= small_ink_max:
                     thin_only[comp > 0] = 255
             kept = thin_only
     except Exception:  # noqa: BLE001
