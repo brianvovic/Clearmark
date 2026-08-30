@@ -322,6 +322,18 @@ def erase(
                 grown = cv2.dilate(
                     traw, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), 1
                 )
+                # Fill the lettering, not the box around it. The detector outlines
+                # a region, so between and beside the glyphs it also covers whatever
+                # they lie on — here a bikini cup, which the fill then repainted
+                # away. Keeping only pixels that differ from their surroundings
+                # leaves garment and skin that merely sit inside the box intact.
+                from services.ink import ink_within
+
+                ink = ink_within(rgb, grown, min_delta=6.0, require_uniform=False)
+                if ink.max() and int((ink > 0).sum()) >= 0.15 * int((grown > 127).sum()):
+                    grown = cv2.dilate(
+                        ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1
+                    )
                 logger.info("trusted direct fill: cov=%.2f%% (guard bypassed)", 100 * cov)
                 filled = np.asarray(
                     inpaint_fullres(Image.fromarray(rgb), Image.fromarray(grown, "L"))
